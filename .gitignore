@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# C/C++/CUDA build artifacts
+build/
+*.so
+*.o
+*.a
+*.dylib
+
+# Python packaging / pip install artifacts
+*.egg-info/
+*.egg
+dist/
+.eggs/
+pip-wheel-metadata/
+
+# CUDA extension build caches (JIT compiled)
+**/_ext/
+**/cuda_kernels/
+
+# nvdiffrast JIT cache
+nvdiffrast/build/
+nvdiffrast/nvdiffrast/*.so
+nvdiffrast/**/*.o
+
+# Environment / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.venv/
+
+# Training outputs (large files)
+outputs/
+
+# Tensorboard logs
+events.out.tfevents.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db

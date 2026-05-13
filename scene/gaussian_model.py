@@ -121,8 +121,8 @@ class GaussianModel:
         self._rotation, 
         self._opacity,
         self._albedo_init,
-        self._metallic,
-        self._roughness,
+        self._metallic_init,
+        self._roughness_init,
         self.diffuse_occ,
         self.grid,
         self.max_pts,
@@ -131,11 +131,13 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        envlight_state_dict) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self.envlight.load_state_dict(envlight_state_dict)
 
     @property
     def get_albedo_init(self):
@@ -235,13 +237,20 @@ class GaussianModel:
             if torch.sum(normal_mask)>0:
                 pts_filter = xyz[normal_mask]
                 dirs = reflective[normal_mask]
-                max_dist = self.get_sphere_intersection(pts_filter, dirs, max_radiu) # pn,1
-                z_vals = torch.linspace(0, 1, sam_pts_num)[16:].cuda()
-                z_vals = max_dist * z_vals.unsqueeze(0)
-                pts_sample = z_vals.unsqueeze(-1) * dirs.unsqueeze(-2) + pts_filter.unsqueeze(-2)
-                pts_weight = self.query_pts_value(pts_sample)
-                pts_weight = torch.sum(pts_weight, dim=-1)
-                pts_occ_weight[normal_mask] = pts_weight.float()
+                N_filtered = pts_filter.shape[0]
+                chunk_size = 4096
+                pts_weight_all = torch.zeros(N_filtered, device="cuda")
+                for cstart in range(0, N_filtered, chunk_size):
+                    cend = min(cstart + chunk_size, N_filtered)
+                    pf = pts_filter[cstart:cend]
+                    dr = dirs[cstart:cend]
+                    max_dist = self.get_sphere_intersection(pf, dr, max_radiu)
+                    z_vals = torch.linspace(0, 1, sam_pts_num)[16:].cuda()
+                    z_vals = max_dist * z_vals.unsqueeze(0)
+                    pts_sample = z_vals.unsqueeze(-1) * dr.unsqueeze(-2) + pf.unsqueeze(-2)
+                    pw = self.query_pts_value(pts_sample)
+                    pts_weight_all[cstart:cend] = torch.sum(pw, dim=-1)
+                pts_occ_weight[normal_mask] = pts_weight_all.float()
             
             occ = pts_occ_weight.float().unsqueeze(-1)
             occ = (occ > 1).float()
@@ -286,15 +295,21 @@ class GaussianModel:
             distances = torch.norm(xyz, dim=1)
             max_radiu = torch.max(distances) + 0.25
             sam_pts_num = 128
+            chunk_size = 4096  # Process points in chunks to avoid OOM
+            P = xyz.shape[0]
             for i in range(self.diffuse_sample_num):
                 dirs = diffuse_directions[:,i,:]
-                max_dist = self.get_sphere_intersection(xyz, dirs, max_radiu) # pn,1
-                z_vals = torch.linspace(0, 1, sam_pts_num)[16:].cuda()
-                z_vals = max_dist * z_vals.unsqueeze(0)
-                pts_sample = z_vals.unsqueeze(-1) * dirs.unsqueeze(-2) + xyz.unsqueeze(-2)
-                pts_weight = self.query_pts_value(pts_sample)
-                pts_weight = torch.sum(pts_weight, dim=-1)
-                self.diffuse_occ[:,i] = (pts_weight > 1).float()
+                for start in range(0, P, chunk_size):
+                    end = min(start + chunk_size, P)
+                    xyz_chunk = xyz[start:end]
+                    dirs_chunk = dirs[start:end]
+                    max_dist = self.get_sphere_intersection(xyz_chunk, dirs_chunk, max_radiu)
+                    z_vals = torch.linspace(0, 1, sam_pts_num)[16:].cuda()
+                    z_vals = max_dist * z_vals.unsqueeze(0)
+                    pts_sample = z_vals.unsqueeze(-1) * dirs_chunk.unsqueeze(-2) + xyz_chunk.unsqueeze(-2)
+                    pts_weight = self.query_pts_value(pts_sample)
+                    pts_weight = torch.sum(pts_weight, dim=-1)
+                    self.diffuse_occ[start:end, i] = (pts_weight > 1).float()
 
     def compute_color(self, camera_center, iteration=None, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, exposure=0.0):
         means3D = self.get_xyz
@@ -333,30 +348,43 @@ class GaussianModel:
         prefix_shape = albedo.shape[:-1]
         diffuse_albedo = (1 - metallic) * albedo
         fg_uv = torch.cat([n_dot_v, roughness], -1).clamp(0, 1)
-        fg = dr.texture(
-            self.get_FG_LUT,
-            fg_uv.reshape(1, -1, 1, 2).contiguous(),
-            filter_mode="linear",
-            boundary_mode="clamp",
-        ).reshape(*prefix_shape, 2)
+        # --- THE ULTIMATE PYTORCH BYPASS ---
+        import torch.nn.functional as F
+        lut = self.get_FG_LUT.permute(0, 3, 1, 2) # Convert to PyTorch layout [1, 2, 256, 256]
+        
+        # Convert OpenGL (0 to 1) coordinates to PyTorch (-1 to 1) coordinates
+        u = fg_uv[:, 0] * 2.0 - 1.0
+        v = 1.0 - 2.0 * fg_uv[:, 1]
+        grid = torch.stack([u, v], dim=-1).reshape(1, -1, 1, 2) 
+        
+        # Sample the texture natively
+        fg = F.grid_sample(lut, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        fg = fg.permute(0, 2, 3, 1).reshape(*prefix_shape, 2)
+        # -----------------------------------
         F0 = (1 - metallic) * 0.04 + metallic * albedo
         specular_albedo = F0 * fg[:, 0:1] + fg[:, 1:2]
         if is_train:
             envlight.build_base()
         envlight.build_mips()
         if iteration > second_stage_step:
-            diffuse_directions = sample_diffuse_directions(shading_normal, self.diffuse_direction_samples, is_train=False)  # [pn,sn0,3]
-            diffuse_directions = rearrange(diffuse_directions, "B N C -> (B N) C")
-            if hdr_rotation:
-                diffuse_directions_x = diffuse_directions[:,0].unsqueeze(-1)
-                diffuse_directions_y = diffuse_directions[:,1].unsqueeze(-1)
-                diffuse_directions_z = diffuse_directions[:,2].unsqueeze(-1)
-                diffuse_directions = torch.cat([-diffuse_directions_y, diffuse_directions_z, -diffuse_directions_x], dim=-1) #rot_y(90)@rot_x(-90)
-            diffuse_light = envlight(diffuse_directions)
-            diffuse_occ = rearrange(self.diffuse_occ, "B N -> (B N)").unsqueeze(1)
-            diffuse_light = (1-diffuse_occ) * diffuse_light
-            diffuse_light = rearrange(diffuse_light, "(B N) C -> B N C", N=self.diffuse_sample_num)
-            diffuse_light = torch.mean(diffuse_light, dim=1)
+            # Process diffuse lighting in point-chunks to avoid OOM
+            _pchunk = 4096
+            P = shading_normal.shape[0]
+            diffuse_light = torch.zeros(P, 3, device="cuda")
+            for pstart in range(0, P, _pchunk):
+                pend = min(pstart + _pchunk, P)
+                chunk_dirs = sample_diffuse_directions(shading_normal[pstart:pend], self.diffuse_direction_samples, is_train=False)
+                chunk_dirs = rearrange(chunk_dirs, "B N C -> (B N) C")
+                if hdr_rotation:
+                    dx = chunk_dirs[:,0].unsqueeze(-1)
+                    dy = chunk_dirs[:,1].unsqueeze(-1)
+                    dz = chunk_dirs[:,2].unsqueeze(-1)
+                    chunk_dirs = torch.cat([-dy, dz, -dx], dim=-1)
+                chunk_light = envlight(chunk_dirs)
+                chunk_occ = rearrange(self.diffuse_occ[pstart:pend], "B N -> (B N)").unsqueeze(1)
+                chunk_light = (1 - chunk_occ) * chunk_light
+                chunk_light = rearrange(chunk_light, "(B N) C -> B N C", N=self.diffuse_sample_num)
+                diffuse_light[pstart:pend] = torch.mean(chunk_light, dim=1)
         else:
             if hdr_rotation:
                 normal_x = shading_normal[:,0].unsqueeze(-1)
@@ -451,7 +479,9 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        # dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        num_points = fused_point_cloud.shape[0]
+        dist2 = torch.full((num_points,), 0.01, dtype=torch.float32, device="cuda")
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
