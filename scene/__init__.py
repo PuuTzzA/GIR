@@ -79,9 +79,11 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
-            self.gaussians.envlight.load_state_dict(torch.load(os.path.join(self.model_path,
-                                                            "chkpnt" + str(self.loaded_iter) +
-                                                            ".pth"))[0][-1])
+            chkpnt_path = os.path.join(self.model_path, "chkpnt" + str(self.loaded_iter) + ".pth")
+            if os.path.exists(chkpnt_path):
+                self.gaussians.envlight.load_state_dict(torch.load(chkpnt_path)[0][-1])
+            else:
+                print(f"Warning: checkpoint {chkpnt_path} not found, using default envlight")
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
