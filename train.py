@@ -10,16 +10,18 @@
 #
 
 import os
+import json
+import time
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, smooth_loss, regularizer_loss, get_mask, tv_loss
+from utils.loss_utils import l1_loss, l2_loss, ssim, smooth_loss, regularizer_loss, get_mask, tv_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import psnr, mse
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -29,8 +31,81 @@ except ImportError:
     TENSORBOARD_FOUND = False
 import torchvision
 from envlight.utils import cubemap_to_latlong
+from lpipsPyTorch import lpips as compute_lpips
+from lpipsPyTorch.modules.lpips import LPIPS
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1):
+def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False):
+    """Evaluate metrics on test and train cameras at the current iteration."""
+    torch.cuda.empty_cache()
+    results = {"iteration": iteration, "train_loss": ema_loss, "num_gaussians": gaussians.get_xyz.shape[0]}
+
+    eval_configs = [
+        {"name": "test", "cameras": scene.getTestCameras()},
+        {"name": "train", "cameras": [scene.getTrainCameras()[idx] for idx in range(0, len(scene.getTrainCameras()), max(1, len(scene.getTrainCameras()) // 5))][:5]},
+    ]
+
+    for config in eval_configs:
+        if not config["cameras"] or len(config["cameras"]) == 0:
+            continue
+
+        psnr_vals, ssim_vals, lpips_vals, l1_vals, mse_vals = [], [], [], [], []
+        visual_pairs = []  # (render, gt) for visual comparison
+
+        for idx, viewpoint in enumerate(config["cameras"]):
+            render_pkg = render(viewpoint, gaussians, pipe, background,
+                                iteration=iteration, is_train=False,
+                                first_stage_step=first_stage_step,
+                                second_stage_step=second_stage_step,
+                                remove_noise=remove_noise,
+                                hdr_rotation=hdr_rotation)
+            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+            gt_image, _ = get_mask(gt_image)
+
+            psnr_vals.append(psnr(image, gt_image).mean().item())
+            ssim_vals.append(ssim(image, gt_image).item())
+            l1_vals.append(l1_loss(image, gt_image).item())
+            mse_vals.append(mse(image, gt_image).mean().item())
+
+            # LPIPS with cached model (moved to GPU temporarily)
+            with torch.no_grad():
+                lpips_model.to("cuda")
+                lpips_val = lpips_model(image.unsqueeze(0) if image.dim() == 3 else image,
+                                       gt_image.unsqueeze(0) if gt_image.dim() == 3 else gt_image)
+                lpips_vals.append(lpips_val.item())
+                lpips_model.to("cpu")
+                torch.cuda.empty_cache()
+
+            if save_visuals and idx < 3:  # Save first 3 views
+                visual_pairs.append((image.detach().cpu(), gt_image.detach().cpu()))
+
+        prefix = config["name"]
+        results[f"{prefix}_psnr"] = sum(psnr_vals) / len(psnr_vals)
+        results[f"{prefix}_ssim"] = sum(ssim_vals) / len(ssim_vals)
+        results[f"{prefix}_lpips"] = sum(lpips_vals) / len(lpips_vals)
+        results[f"{prefix}_l1"] = sum(l1_vals) / len(l1_vals)
+        results[f"{prefix}_mse"] = sum(mse_vals) / len(mse_vals)
+
+        # Save visual comparison grids
+        if save_visuals and visual_pairs:
+            vis_path = os.path.join(scene.model_path, "eval_visuals", prefix)
+            os.makedirs(vis_path, exist_ok=True)
+            for vi, (rend, gt) in enumerate(visual_pairs):
+                grid = torchvision.utils.make_grid([rend, gt], nrow=2, padding=4, pad_value=1.0)
+                torchvision.utils.save_image(grid, os.path.join(vis_path, f"iter{iteration:06d}_view{vi}.png"))
+
+    print(f"\n[ITER {iteration}] Eval — "
+          f"Test PSNR: {results.get('test_psnr', 0):.2f}, "
+          f"SSIM: {results.get('test_ssim', 0):.4f}, "
+          f"LPIPS: {results.get('test_lpips', 0):.4f}, "
+          f"L1: {results.get('test_l1', 0):.6f}, "
+          f"MSE: {results.get('test_mse', 0):.6f}")
+    sys.stdout.flush()
+    torch.cuda.empty_cache()
+    return results
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -45,6 +120,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+
+    # --- Periodic evaluation setup ---
+    metrics_log_path = os.path.join(scene.model_path, "metrics_log.json")
+    if checkpoint and os.path.exists(metrics_log_path):
+        with open(metrics_log_path, "r") as f:
+            metrics_log = json.load(f)
+        # Remove entries at or after the resumed iteration to avoid duplicates
+        metrics_log = [m for m in metrics_log if m["iteration"] < first_iter]
+        print(f"Loaded {len(metrics_log)} existing metric entries from {metrics_log_path}")
+    else:
+        metrics_log = []
+
+    # Cache the LPIPS model on CPU to save GPU memory; moved to GPU only during eval
+    lpips_model = LPIPS("vgg", "0.1").cpu()
+    lpips_model.eval()
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -250,6 +340,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+            # --- Periodic evaluation ---
+            if iteration % eval_interval == 0 or iteration == opt.iterations:
+                save_visuals = (iteration % visual_interval == 0) or (iteration == opt.iterations)
+                eval_results = periodic_evaluation(
+                    iteration, scene, gaussians, pipe, background,
+                    first_stage_step, second_stage_step, remove_noise, hdr_rotation,
+                    ema_loss_for_log, lpips_model, save_visuals=save_visuals
+                )
+                metrics_log.append(eval_results)
+                with open(metrics_log_path, "w") as f:
+                    json.dump(metrics_log, f, indent=2)
+
+    # --- Generate PDF report after training ---
+    print("\nGenerating training report PDF...")
+    try:
+        from generate_report import generate_report
+        report_path = generate_report(scene.model_path)
+        print(f"Training report saved to: {report_path}")
+    except Exception as e:
+        print(f"Warning: Could not generate PDF report: {e}")
+        print("You can generate it manually with: python generate_report.py --model_path " + scene.model_path)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -332,6 +444,8 @@ if __name__ == "__main__":
     parser.add_argument("--hdr_rotation", action="store_true", default=False)
     parser.add_argument("--reg_hdr_weight", type=float, default=0.001)
     parser.add_argument("--reg_material_weight", type=float, default=0.1)
+    parser.add_argument("--eval_interval", type=int, default=2000, help="Evaluate metrics every N iterations")
+    parser.add_argument("--visual_interval", type=int, default=10000, help="Save visual comparisons every N iterations")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -343,7 +457,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval)
 
     # All done
     print("\nTraining complete.")
