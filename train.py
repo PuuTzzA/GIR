@@ -144,6 +144,16 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False):
+    if opt.iterations < 10000:
+        eval_interval = max(1, opt.iterations // 100)
+        visual_interval = max(1, opt.iterations // 20)
+    elif opt.iterations < 30000:
+        eval_interval = max(1, opt.iterations // 60)
+        visual_interval = max(1, opt.iterations // 10)
+    else:
+        eval_interval = max(1, opt.iterations // 30)
+        visual_interval = max(1, opt.iterations // 6)
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -277,7 +287,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         loss_normal_gt_val = (1.0 - cos_sim).mean() * lambda_normal_gt
                     
                         # Metallic loss: push rendered metallic toward GT
-                        gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
+                        if isinstance(gt_metallic_val, torch.Tensor):
+                            gt_metallic = gt_metallic_val
+                        else:
+                            gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
                         loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic) * lambda_metallic_gt
                 else:
                     # Albedo loss: L1 + SSIM
@@ -292,7 +305,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_normal_gt_val = (1.0 - cos_sim).mean() * lambda_normal_gt
                 
                     # Metallic loss: push rendered metallic toward GT
-                    gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
+                    if isinstance(gt_metallic_val, torch.Tensor):
+                        gt_metallic = gt_metallic_val
+                    else:
+                        gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
                     loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic) * lambda_metallic_gt
                 
                     loss = loss + loss_albedo_gt_val + loss_normal_gt_val + loss_metallic_gt_val

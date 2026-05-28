@@ -243,8 +243,18 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 basename = os.path.basename(frame["file_path"])  # "rgba_042"
                 frame_idx_str = basename.split("_")[-1]  # "042"
 
+                # Try with "_gt" suffix first, fallback to standard directory
                 albedo_gt_path = os.path.join(gt_priors_dir, "albedo_gt", f"albedo_{frame_idx_str}.png")
+                if not os.path.exists(albedo_gt_path):
+                    albedo_gt_path = os.path.join(gt_priors_dir, "albedo", f"albedo_{frame_idx_str}.png")
+
                 normal_gt_path = os.path.join(gt_priors_dir, "normal_gt", f"normal_{frame_idx_str}.png")
+                if not os.path.exists(normal_gt_path):
+                    normal_gt_path = os.path.join(gt_priors_dir, "normal", f"normal_{frame_idx_str}.png")
+
+                metallic_gt_path = os.path.join(gt_priors_dir, "metallic_gt", f"metallic_{frame_idx_str}.png")
+                if not os.path.exists(metallic_gt_path):
+                    metallic_gt_path = os.path.join(gt_priors_dir, "metallic", f"metallic_{frame_idx_str}.png")
 
                 if os.path.exists(albedo_gt_path):
                     albedo_gt_img = Image.open(albedo_gt_path)
@@ -255,6 +265,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                     normal_gt_img = Image.open(normal_gt_path)
                 else:
                     print(f"[WARNING] Normal GT not found: {normal_gt_path}")
+
+                if os.path.exists(metallic_gt_path):
+                    metallic_gt = Image.open(metallic_gt_path)
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], exposure=exposure,
@@ -323,25 +336,35 @@ def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png"):
 
     has_train_gt = (os.path.isdir(os.path.join(train_gt_dir, "albedo_gt")) and
                     os.path.isdir(os.path.join(train_gt_dir, "normal_gt")))
+    has_train_priors = (os.path.isdir(os.path.join(train_gt_dir, "albedo")) and
+                        os.path.isdir(os.path.join(train_gt_dir, "normal")))
+
     has_test_gt = (os.path.isdir(os.path.join(test_gt_dir, "albedo_gt")) and
                    os.path.isdir(os.path.join(test_gt_dir, "normal_gt")))
+    has_test_priors = (os.path.isdir(os.path.join(test_gt_dir, "albedo")) and
+                       os.path.isdir(os.path.join(test_gt_dir, "normal")))
 
     if has_train_gt:
         print("Found GT priors (albedo_gt, normal_gt) in train split")
+    elif has_train_priors:
+        print("Found prior directories (albedo, normal) in train split")
+
     if has_test_gt:
         print("Found GT priors (albedo_gt, normal_gt) in test split")
+    elif has_test_priors:
+        print("Found prior directories (albedo, normal) in test split")
 
     print("Reading Synthetic-with-Priors Training Transforms")
     train_cam_infos = readCamerasFromTransforms(
         path, "transforms_train.json", white_background, extension,
-        gt_priors_dir=train_gt_dir if has_train_gt else None,
-        metallic_gt_value=0.0 if has_train_gt else None)
+        gt_priors_dir=train_gt_dir if (has_train_gt or has_train_priors) else None,
+        metallic_gt_value=0.0 if (has_train_gt or has_train_priors) else None)
 
     print("Reading Synthetic-with-Priors Test Transforms")
     test_cam_infos = readCamerasFromTransforms(
         path, "transforms_test.json", white_background, extension,
-        gt_priors_dir=test_gt_dir if has_test_gt else None,
-        metallic_gt_value=0.0 if has_test_gt else None)
+        gt_priors_dir=test_gt_dir if (has_test_gt or has_test_priors) else None,
+        metallic_gt_value=0.0 if (has_test_gt or has_test_priors) else None)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)

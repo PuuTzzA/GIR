@@ -60,7 +60,10 @@ class Camera(nn.Module):
 
         self.albedo_gt = albedo_gt.to(self.data_device) if albedo_gt is not None else None
         self.normal_gt = normal_gt.to(self.data_device) if normal_gt is not None else None
-        self.metallic_gt = metallic_gt
+        if isinstance(metallic_gt, torch.Tensor):
+            self.metallic_gt = metallic_gt.to(self.data_device)
+        else:
+            self.metallic_gt = metallic_gt
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -57,11 +57,16 @@ def loadCam(args, id, cam_info, resolution_scale):
     if cam_info.normal_gt is not None:
         normal_gt_tensor = PILtoTorch(cam_info.normal_gt, resolution)[:3, ...]
 
+    metallic_gt_tensor = cam_info.metallic_gt
+    from PIL import Image
+    if isinstance(cam_info.metallic_gt, Image.Image):
+        metallic_gt_tensor = PILtoTorch(cam_info.metallic_gt, resolution)[:1, ...]
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device, exposure=cam_info.exposure,
-                  albedo_gt=albedo_gt_tensor, normal_gt=normal_gt_tensor, metallic_gt=cam_info.metallic_gt)
+                  albedo_gt=albedo_gt_tensor, normal_gt=normal_gt_tensor, metallic_gt=metallic_gt_tensor)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
