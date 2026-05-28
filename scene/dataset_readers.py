@@ -35,6 +35,9 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     exposure: float
+    albedo_gt: object = None   # PIL Image or None
+    normal_gt: object = None   # PIL Image or None
+    metallic_gt: float = None  # scalar (e.g. 0.0) or None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -177,7 +180,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, metallic_gt_value=None):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -229,9 +232,33 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
                 FovY = fovx 
                 FovX = fovy
-            
+
+            # --- Load GT priors if available ---
+            albedo_gt_img = None
+            normal_gt_img = None
+            metallic_gt = metallic_gt_value
+
+            if gt_priors_dir is not None:
+                # Derive frame index from file_path, e.g. "./train/rgba/rgba_042" -> "042"
+                basename = os.path.basename(frame["file_path"])  # "rgba_042"
+                frame_idx_str = basename.split("_")[-1]  # "042"
+
+                albedo_gt_path = os.path.join(gt_priors_dir, "albedo_gt", f"albedo_{frame_idx_str}.png")
+                normal_gt_path = os.path.join(gt_priors_dir, "normal_gt", f"normal_{frame_idx_str}.png")
+
+                if os.path.exists(albedo_gt_path):
+                    albedo_gt_img = Image.open(albedo_gt_path)
+                else:
+                    print(f"[WARNING] Albedo GT not found: {albedo_gt_path}")
+
+                if os.path.exists(normal_gt_path):
+                    normal_gt_img = Image.open(normal_gt_path)
+                else:
+                    print(f"[WARNING] Normal GT not found: {normal_gt_path}")
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], exposure=exposure))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], exposure=exposure,
+                            albedo_gt=albedo_gt_img, normal_gt=normal_gt_img, metallic_gt=metallic_gt))
             
     return cam_infos
 
@@ -271,7 +298,83 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def isSyntheticWithPriors(path):
+    """Detect whether a dataset path is a synthetic-with-priors dataset.
+
+    Synthetic-with-priors datasets (e.g. armadillo, lego) are distinguished
+    from vanilla Blender datasets by having a train/rgba/ subdirectory
+    alongside transforms_train.json.
+    """
+    has_transforms = os.path.exists(os.path.join(path, "transforms_train.json"))
+    has_rgba_subdir = os.path.isdir(os.path.join(path, "train", "rgba"))
+    return has_transforms and has_rgba_subdir
+
+def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png"):
+    """Read a synthetic dataset from the datasets_with_priors directory.
+
+    These datasets (e.g. armadillo, lego) use the Blender/synthetic camera
+    convention with transforms_*.json files, and store images under
+    {train,val,test}/rgba/.  GT priors (albedo_gt, normal_gt) are loaded
+    when available; metallic GT is fixed at 0.0.
+    """
+    # Detect GT priors availability per split
+    train_gt_dir = os.path.join(path, "train")
+    test_gt_dir = os.path.join(path, "test")
+
+    has_train_gt = (os.path.isdir(os.path.join(train_gt_dir, "albedo_gt")) and
+                    os.path.isdir(os.path.join(train_gt_dir, "normal_gt")))
+    has_test_gt = (os.path.isdir(os.path.join(test_gt_dir, "albedo_gt")) and
+                   os.path.isdir(os.path.join(test_gt_dir, "normal_gt")))
+
+    if has_train_gt:
+        print("Found GT priors (albedo_gt, normal_gt) in train split")
+    if has_test_gt:
+        print("Found GT priors (albedo_gt, normal_gt) in test split")
+
+    print("Reading Synthetic-with-Priors Training Transforms")
+    train_cam_infos = readCamerasFromTransforms(
+        path, "transforms_train.json", white_background, extension,
+        gt_priors_dir=train_gt_dir if has_train_gt else None,
+        metallic_gt_value=0.0 if has_train_gt else None)
+
+    print("Reading Synthetic-with-Priors Test Transforms")
+    test_cam_infos = readCamerasFromTransforms(
+        path, "transforms_test.json", white_background, extension,
+        gt_priors_dir=test_gt_dir if has_test_gt else None,
+        metallic_gt_value=0.0 if has_test_gt else None)
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        # Synthetic datasets have no COLMAP data, so we initialise with
+        # random points inside the scene bounds.
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "SyntheticWithPriors": readSyntheticWithPriorsInfo,
 }

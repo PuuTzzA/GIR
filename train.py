@@ -13,6 +13,7 @@ import os
 import json
 import time
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, l2_loss, ssim, smooth_loss, regularizer_loss, get_mask, tv_loss
 from gaussian_renderer import render, network_gui
@@ -49,6 +50,8 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
             continue
 
         psnr_vals, ssim_vals, lpips_vals, l1_vals, mse_vals = [], [], [], [], []
+        albedo_psnr_vals, albedo_ssim_vals, albedo_l1_vals = [], [], []
+        normal_angular_error_vals = []
         visual_pairs = []  # (render, gt) for visual comparison
 
         for idx, viewpoint in enumerate(config["cameras"]):
@@ -66,6 +69,30 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
             ssim_vals.append(ssim(image, gt_image).item())
             l1_vals.append(l1_loss(image, gt_image).item())
             mse_vals.append(mse(image, gt_image).mean().item())
+
+            if hasattr(viewpoint, 'albedo_gt') and viewpoint.albedo_gt is not None:
+                gt_albedo = viewpoint.albedo_gt
+                rendered_albedo = render_pkg.get("rendered_albedo", None)
+                if rendered_albedo is not None:
+                    rendered_albedo_cpu = rendered_albedo.detach().cpu()
+                    gt_albedo_cpu = gt_albedo.detach().cpu()
+                    rendered_albedo_clamped = torch.clamp(rendered_albedo_cpu, 0.0, 1.0)
+                    albedo_psnr_vals.append(psnr(rendered_albedo_clamped, gt_albedo_cpu).mean().item())
+                    albedo_ssim_vals.append(ssim(rendered_albedo_clamped, gt_albedo_cpu).item())
+                    albedo_l1_vals.append(l1_loss(rendered_albedo_clamped, gt_albedo_cpu).item())
+                
+                gt_normal = viewpoint.normal_gt
+                rendered_normal = render_pkg.get("rendered_normal", None)
+                if rendered_normal is not None:
+                    rendered_normal_cpu = rendered_normal.detach().cpu()
+                    gt_normal_cpu = gt_normal.detach().cpu()
+                    pred_n = rendered_normal_cpu * 2.0 - 1.0
+                    gt_n = gt_normal_cpu * 2.0 - 1.0
+                    pred_n = F.normalize(pred_n, p=2, dim=0)
+                    gt_n = F.normalize(gt_n, p=2, dim=0)
+                    cos_sim = torch.clamp(torch.sum(pred_n * gt_n, dim=0), -1.0, 1.0)
+                    ang_error = torch.acos(cos_sim) * 180.0 / 3.141592653589793
+                    normal_angular_error_vals.append(ang_error.mean().item())
 
             # LPIPS with cached model (moved to GPU temporarily)
             with torch.no_grad():
@@ -86,6 +113,13 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
         results[f"{prefix}_l1"] = sum(l1_vals) / len(l1_vals)
         results[f"{prefix}_mse"] = sum(mse_vals) / len(mse_vals)
 
+        if albedo_psnr_vals:
+            results[f"{prefix}_albedo_psnr"] = sum(albedo_psnr_vals) / len(albedo_psnr_vals)
+            results[f"{prefix}_albedo_ssim"] = sum(albedo_ssim_vals) / len(albedo_ssim_vals)
+            results[f"{prefix}_albedo_l1"] = sum(albedo_l1_vals) / len(albedo_l1_vals)
+        if normal_angular_error_vals:
+            results[f"{prefix}_normal_ang_err"] = sum(normal_angular_error_vals) / len(normal_angular_error_vals)
+
         # Save visual comparison grids
         if save_visuals and visual_pairs:
             vis_path = os.path.join(scene.model_path, "eval_visuals", prefix)
@@ -94,18 +128,22 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                 grid = torchvision.utils.make_grid([rend, gt], nrow=2, padding=4, pad_value=1.0)
                 torchvision.utils.save_image(grid, os.path.join(vis_path, f"iter{iteration:06d}_view{vi}.png"))
 
+    albedo_info = ""
+    if "test_albedo_psnr" in results:
+        albedo_info = f", Alb PSNR: {results['test_albedo_psnr']:.2f}, Norm Err: {results['test_normal_ang_err']:.2f} deg"
+
     print(f"\n[ITER {iteration}] Eval — "
           f"Test PSNR: {results.get('test_psnr', 0):.2f}, "
           f"SSIM: {results.get('test_ssim', 0):.4f}, "
           f"LPIPS: {results.get('test_lpips', 0):.4f}, "
           f"L1: {results.get('test_l1', 0):.6f}, "
-          f"MSE: {results.get('test_mse', 0):.6f}")
+          f"MSE: {results.get('test_mse', 0):.6f}{albedo_info}")
     sys.stdout.flush()
     torch.cuda.empty_cache()
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -201,6 +239,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         visibility_filter = render_pkg["visibility_filter"]
         radii = render_pkg["radii"] 
         # Loss
+        loss_albedo_gt_val = torch.tensor(0.0).cuda()
+        loss_normal_gt_val = torch.tensor(0.0).cuda()
+        loss_metallic_gt_val = torch.tensor(0.0).cuda()
+
         gt_image = viewpoint_cam.original_image.cuda()
         gt_image, gt_mask = get_mask(gt_image)        
         gt_image = gt_image * gt_mask + bg.unsqueeze(-1).unsqueeze(-1).repeat(1, gt_image.shape[1], gt_image.shape[2]) * (1-gt_mask)
@@ -214,6 +256,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_metallic = tv_loss(rendered_metallic) * reg_material_weight
             loss_roughness = tv_loss(rendered_roughness) * reg_material_weight
             loss = loss + loss_albedo + loss_normal + loss_metallic + loss_roughness + loss_regularizer #+ Ll1_alpha
+
+            # --- Extended GT-supervised PBR losses ---
+            if hasattr(viewpoint_cam, 'albedo_gt') and viewpoint_cam.albedo_gt is not None:
+                gt_albedo = viewpoint_cam.albedo_gt
+                gt_normal = viewpoint_cam.normal_gt
+                gt_metallic_val = viewpoint_cam.metallic_gt
+            
+                if exclude_prior_loss:
+                    with torch.no_grad():
+                        # Albedo loss: L1 + SSIM
+                        loss_albedo_gt_val = (1.0 - opt.lambda_dssim) * l1_loss(rendered_albedo, gt_albedo) \
+                                           + opt.lambda_dssim * (1.0 - ssim(rendered_albedo, gt_albedo))
+                        loss_albedo_gt_val *= lambda_albedo_gt
+                    
+                        # Normal loss: cosine similarity in [-1,1] space
+                        pred_n = rendered_normal * 2.0 - 1.0
+                        gt_n = gt_normal * 2.0 - 1.0
+                        cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
+                        loss_normal_gt_val = (1.0 - cos_sim).mean() * lambda_normal_gt
+                    
+                        # Metallic loss: push rendered metallic toward GT
+                        gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
+                        loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic) * lambda_metallic_gt
+                else:
+                    # Albedo loss: L1 + SSIM
+                    loss_albedo_gt_val = (1.0 - opt.lambda_dssim) * l1_loss(rendered_albedo, gt_albedo) \
+                                       + opt.lambda_dssim * (1.0 - ssim(rendered_albedo, gt_albedo))
+                    loss_albedo_gt_val *= lambda_albedo_gt
+                
+                    # Normal loss: cosine similarity in [-1,1] space
+                    pred_n = rendered_normal * 2.0 - 1.0
+                    gt_n = gt_normal * 2.0 - 1.0
+                    cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
+                    loss_normal_gt_val = (1.0 - cos_sim).mean() * lambda_normal_gt
+                
+                    # Metallic loss: push rendered metallic toward GT
+                    gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
+                    loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic) * lambda_metallic_gt
+                
+                    loss = loss + loss_albedo_gt_val + loss_normal_gt_val + loss_metallic_gt_val
         loss.backward()
         iter_end.record()
 
@@ -301,6 +383,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 os.makedirs(occ_path, exist_ok=True)
                 torchvision.utils.save_image(rendered_occ.detach().cpu(), os.path.join(occ_path, '{0:05d}'.format(iteration) + ".png"))
             
+            if hasattr(viewpoint_cam, 'albedo_gt') and viewpoint_cam.albedo_gt is not None and rendered_albedo is not None and rendered_normal is not None:
+                albedo_comp_path = os.path.join(scene.model_path, "train_process", "albedo_gt_comparison")
+                os.makedirs(albedo_comp_path, exist_ok=True)
+                albedo_grid = torchvision.utils.make_grid([rendered_albedo.detach().cpu(), viewpoint_cam.albedo_gt.detach().cpu()], nrow=2, padding=4, pad_value=1.0)
+                torchvision.utils.save_image(albedo_grid, os.path.join(albedo_comp_path, '{0:05d}'.format(iteration) + ".png"))
+
+                normal_comp_path = os.path.join(scene.model_path, "train_process", "normal_gt_comparison")
+                os.makedirs(normal_comp_path, exist_ok=True)
+                normal_grid = torchvision.utils.make_grid([rendered_normal.detach().cpu(), viewpoint_cam.normal_gt.detach().cpu()], nrow=2, padding=4, pad_value=1.0)
+                torchvision.utils.save_image(normal_grid, os.path.join(normal_comp_path, '{0:05d}'.format(iteration) + ".png"))
+
+                albedo_err_path = os.path.join(scene.model_path, "train_process", "albedo_error")
+                os.makedirs(albedo_err_path, exist_ok=True)
+                albedo_err = torch.abs(rendered_albedo.detach().cpu() - viewpoint_cam.albedo_gt.detach().cpu()).mean(dim=0, keepdim=True).repeat(3, 1, 1)
+                torchvision.utils.save_image(albedo_err, os.path.join(albedo_err_path, '{0:05d}'.format(iteration) + ".png"))
+
+                normal_err_path = os.path.join(scene.model_path, "train_process", "normal_error")
+                os.makedirs(normal_err_path, exist_ok=True)
+                normal_err = torch.abs(rendered_normal.detach().cpu() - viewpoint_cam.normal_gt.detach().cpu()).mean(dim=0, keepdim=True).repeat(3, 1, 1)
+                torchvision.utils.save_image(normal_err, os.path.join(normal_err_path, '{0:05d}'.format(iteration) + ".png"))
+
+                if hasattr(gaussians, 'envlight') and gaussians.envlight is not None:
+                    hdr_base = gaussians.envlight.base.detach()
+                    print(f"\n[ITER {iteration}] EnvMap Stats — Min: {hdr_base.min().item():.4f}, Max: {hdr_base.max().item():.4f}, Mean: {hdr_base.mean().item():.4f}")
+                
+                print(f"[ITER {iteration}] Extended Loss — albedo_gt: {loss_albedo_gt_val.item():.4f}, normal_gt: {loss_normal_gt_val.item():.4f}, metallic_gt: {loss_metallic_gt_val.item():.4f}")
+                
+                loss_log_path = os.path.join(scene.model_path, "train_process", "loss_components.json")
+                loss_entry = {
+                    "iteration": iteration,
+                    "albedo_gt": loss_albedo_gt_val.item(),
+                    "normal_gt": loss_normal_gt_val.item(),
+                    "metallic_gt": loss_metallic_gt_val.item()
+                }
+                
+                loss_logs = []
+                if os.path.exists(loss_log_path):
+                    with open(loss_log_path, "r") as f:
+                        try:
+                            loss_logs = json.load(f)
+                        except json.JSONDecodeError:
+                            loss_logs = []
+                loss_logs.append(loss_entry)
+                with open(loss_log_path, "w") as f:
+                    json.dump(loss_logs, f, indent=2)
 
         with torch.no_grad():
             # Progress bar
@@ -369,6 +496,7 @@ def prepare_output_and_logger(args):
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
+    args.model_path = os.path.abspath(args.model_path)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -446,6 +574,10 @@ if __name__ == "__main__":
     parser.add_argument("--reg_material_weight", type=float, default=0.1)
     parser.add_argument("--eval_interval", type=int, default=2000, help="Evaluate metrics every N iterations")
     parser.add_argument("--visual_interval", type=int, default=10000, help="Save visual comparisons every N iterations")
+    parser.add_argument("--lambda_albedo_gt", type=float, default=0.5, help="Weight for albedo GT loss")
+    parser.add_argument("--lambda_normal_gt", type=float, default=0.1, help="Weight for normal GT loss")
+    parser.add_argument("--lambda_metallic_gt", type=float, default=0.05, help="Weight for metallic GT loss")
+    parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -457,7 +589,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss)
 
     # All done
     print("\nTraining complete.")
