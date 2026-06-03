@@ -38,6 +38,7 @@ from lpipsPyTorch.modules.lpips import LPIPS
 def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False):
     """Evaluate metrics on test and train cameras at the current iteration."""
     torch.cuda.empty_cache()
+    lpips_model.to("cuda")
     results = {"iteration": iteration, "train_loss": ema_loss, "num_gaussians": gaussians.get_xyz.shape[0]}
 
     eval_configs = [
@@ -69,39 +70,31 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
             ssim_vals.append(ssim(image, gt_image).item())
             l1_vals.append(l1_loss(image, gt_image).item())
             mse_vals.append(mse(image, gt_image).mean().item())
-
             if hasattr(viewpoint, 'albedo_gt') and viewpoint.albedo_gt is not None:
                 gt_albedo = viewpoint.albedo_gt
                 rendered_albedo = render_pkg.get("rendered_albedo", None)
                 if rendered_albedo is not None:
-                    rendered_albedo_cpu = rendered_albedo.detach().cpu()
-                    gt_albedo_cpu = gt_albedo.detach().cpu()
-                    rendered_albedo_clamped = torch.clamp(rendered_albedo_cpu, 0.0, 1.0)
-                    albedo_psnr_vals.append(psnr(rendered_albedo_clamped, gt_albedo_cpu).mean().item())
-                    albedo_ssim_vals.append(ssim(rendered_albedo_clamped, gt_albedo_cpu).item())
-                    albedo_l1_vals.append(l1_loss(rendered_albedo_clamped, gt_albedo_cpu).item())
+                    rendered_albedo_clamped = torch.clamp(rendered_albedo, 0.0, 1.0)
+                    albedo_psnr_vals.append(psnr(rendered_albedo_clamped, gt_albedo).mean().item())
+                    albedo_ssim_vals.append(ssim(rendered_albedo_clamped, gt_albedo).item())
+                    albedo_l1_vals.append(l1_loss(rendered_albedo_clamped, gt_albedo).item())
                 
                 gt_normal = viewpoint.normal_gt
                 rendered_normal = render_pkg.get("rendered_normal", None)
                 if rendered_normal is not None:
-                    rendered_normal_cpu = rendered_normal.detach().cpu()
-                    gt_normal_cpu = gt_normal.detach().cpu()
-                    pred_n = rendered_normal_cpu * 2.0 - 1.0
-                    gt_n = gt_normal_cpu * 2.0 - 1.0
+                    pred_n = rendered_normal * 2.0 - 1.0
+                    gt_n = gt_normal * 2.0 - 1.0
                     pred_n = F.normalize(pred_n, p=2, dim=0)
                     gt_n = F.normalize(gt_n, p=2, dim=0)
                     cos_sim = torch.clamp(torch.sum(pred_n * gt_n, dim=0), -1.0, 1.0)
                     ang_error = torch.acos(cos_sim) * 180.0 / 3.141592653589793
                     normal_angular_error_vals.append(ang_error.mean().item())
 
-            # LPIPS with cached model (moved to GPU temporarily)
+            # LPIPS with cached model (already on GPU)
             with torch.no_grad():
-                lpips_model.to("cuda")
                 lpips_val = lpips_model(image.unsqueeze(0) if image.dim() == 3 else image,
                                        gt_image.unsqueeze(0) if gt_image.dim() == 3 else gt_image)
                 lpips_vals.append(lpips_val.item())
-                lpips_model.to("cpu")
-                torch.cuda.empty_cache()
 
             if save_visuals and idx < 3:  # Save first 3 views
                 visual_pairs.append((image.detach().cpu(), gt_image.detach().cpu()))
@@ -139,20 +132,33 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
           f"L1: {results.get('test_l1', 0):.6f}, "
           f"MSE: {results.get('test_mse', 0):.6f}{albedo_info}")
     sys.stdout.flush()
+    lpips_model.to("cpu")
     torch.cuda.empty_cache()
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False):
-    if opt.iterations < 10000:
-        eval_interval = max(1, opt.iterations // 100)
-        visual_interval = max(1, opt.iterations // 20)
-    elif opt.iterations < 30000:
-        eval_interval = max(1, opt.iterations // 60)
-        visual_interval = max(1, opt.iterations // 10)
-    else:
-        eval_interval = max(1, opt.iterations // 30)
-        visual_interval = max(1, opt.iterations // 6)
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False, freeze_uncertainty_weights=False):
+    # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
+    # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
+    user_eval_set = (eval_interval != 2000)
+    user_visual_set = (visual_interval != 10000)
+
+    if not user_eval_set:
+        if opt.iterations < 10000:
+            eval_interval = max(1, opt.iterations // 10)  # Target ~10 evaluations
+        elif opt.iterations < 30000:
+            eval_interval = max(1, opt.iterations // 30)  # Target ~30 evaluations
+        else:
+            eval_interval = 2000
+            
+    if not user_visual_set:
+        if opt.iterations < 10000:
+            visual_interval = max(1, opt.iterations // 3)   # Target ~3 visual saves
+        elif opt.iterations < 30000:
+            visual_interval = max(1, opt.iterations // 10)  # Target ~10 visual saves
+        else:
+            visual_interval = 10000
+
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -179,6 +185,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"Loaded {len(metrics_log)} existing metric entries from {metrics_log_path}")
     else:
         metrics_log = []
+
+    # --- Periodic loss components setup ---
+    loss_log_path = os.path.join(scene.model_path, "train_process", "loss_components.json")
+    if checkpoint and os.path.exists(loss_log_path):
+        with open(loss_log_path, "r") as f:
+            try:
+                loss_logs = json.load(f)
+                # Remove entries at or after the resumed iteration to avoid duplicates
+                loss_logs = [l for l in loss_logs if l["iteration"] < first_iter]
+                print(f"Loaded {len(loss_logs)} existing loss component entries from {loss_log_path}")
+            except Exception:
+                loss_logs = []
+    else:
+        loss_logs = []
+        # If not resuming, remove any stale loss_components.json from previous runs
+        if os.path.exists(loss_log_path):
+            try:
+                os.remove(loss_log_path)
+            except OSError:
+                pass
 
     # Cache the LPIPS model on CPU to save GPU memory; moved to GPU only during eval
     lpips_model = LPIPS("vgg", "0.1").cpu()
@@ -267,52 +293,67 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_roughness = tv_loss(rendered_roughness) * reg_material_weight
             loss = loss + loss_albedo + loss_normal + loss_metallic + loss_roughness + loss_regularizer #+ Ll1_alpha
 
-            # --- Extended GT-supervised PBR losses ---
+            # --- Extended GT-supervised PBR losses (Kendall et al. uncertainty weighting) ---
             if hasattr(viewpoint_cam, 'albedo_gt') and viewpoint_cam.albedo_gt is not None:
                 gt_albedo = viewpoint_cam.albedo_gt
                 gt_normal = viewpoint_cam.normal_gt
                 gt_metallic_val = viewpoint_cam.metallic_gt
-            
+
+                if isinstance(gt_metallic_val, torch.Tensor):
+                    gt_metallic = gt_metallic_val
+                else:
+                    gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
+
                 if exclude_prior_loss:
+                    # Compute base losses without gradients — logging only
                     with torch.no_grad():
-                        # Albedo loss: L1 + SSIM
                         loss_albedo_gt_val = (1.0 - opt.lambda_dssim) * l1_loss(rendered_albedo, gt_albedo) \
-                                           + opt.lambda_dssim * (1.0 - ssim(rendered_albedo, gt_albedo))
-                        loss_albedo_gt_val *= lambda_albedo_gt
-                    
-                        # Normal loss: cosine similarity in [-1,1] space
+                                             + opt.lambda_dssim * (1.0 - ssim(rendered_albedo, gt_albedo))
                         pred_n = rendered_normal * 2.0 - 1.0
                         gt_n = gt_normal * 2.0 - 1.0
                         cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
-                        loss_normal_gt_val = (1.0 - cos_sim).mean() * lambda_normal_gt
-                    
-                        # Metallic loss: push rendered metallic toward GT
-                        if isinstance(gt_metallic_val, torch.Tensor):
-                            gt_metallic = gt_metallic_val
-                        else:
-                            gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
-                        loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic) * lambda_metallic_gt
+                        loss_normal_gt_val = (1.0 - cos_sim).mean()
+                        loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic)
                 else:
-                    # Albedo loss: L1 + SSIM
-                    loss_albedo_gt_val = (1.0 - opt.lambda_dssim) * l1_loss(rendered_albedo, gt_albedo) \
+                    # Compute base (unweighted) losses for each G-buffer channel
+                    base_loss_albedo = (1.0 - opt.lambda_dssim) * l1_loss(rendered_albedo, gt_albedo) \
                                        + opt.lambda_dssim * (1.0 - ssim(rendered_albedo, gt_albedo))
-                    loss_albedo_gt_val *= lambda_albedo_gt
-                
-                    # Normal loss: cosine similarity in [-1,1] space
                     pred_n = rendered_normal * 2.0 - 1.0
                     gt_n = gt_normal * 2.0 - 1.0
                     cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
-                    loss_normal_gt_val = (1.0 - cos_sim).mean() * lambda_normal_gt
-                
-                    # Metallic loss: push rendered metallic toward GT
-                    if isinstance(gt_metallic_val, torch.Tensor):
-                        gt_metallic = gt_metallic_val
-                    else:
-                        gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
-                    loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic) * lambda_metallic_gt
-                
-                    loss = loss + loss_albedo_gt_val + loss_normal_gt_val + loss_metallic_gt_val
+                    base_loss_normal = (1.0 - cos_sim).mean()
+                    base_loss_metallic = l1_loss(rendered_metallic, gt_metallic)
+
+                    # Store for logging (detached from graph)
+                    loss_albedo_gt_val = base_loss_albedo.detach()
+                    loss_normal_gt_val = base_loss_normal.detach()
+                    loss_metallic_gt_val = base_loss_metallic.detach()
+
+                    # Kendall et al. multi-task uncertainty weighting:
+                    #   L_prior = sum_i [ L_i * exp(-w_i) + w_i ]
+                    # where w_i is a learnable log-variance scalar.
+                    #
+                    # CRITICAL STABILITY POLISH: To prevent exponential overflow (exp(-w) -> infinity)
+                    # and numerical NaN crashes when base losses become extremely close to zero,
+                    # we clamp the log-variance parameters w to a safe operational range of [-5.0, 10.0].
+                    # This allows effective loss weights to scale up to exp(5.0) ≈ 148.4x down to exp(-10.0) ≈ 4.5e-5x.
+                    w_a = torch.clamp(gaussians._w_albedo, min=-5.0, max=10.0)
+                    w_m = torch.clamp(gaussians._w_metallic, min=-5.0, max=10.0)
+                    w_n = torch.clamp(gaussians._w_normal, min=-5.0, max=10.0)
+
+                    loss_prior = (base_loss_albedo * torch.exp(-w_a) + w_a) \
+                               + (base_loss_metallic * torch.exp(-w_m) + w_m) \
+                               + (base_loss_normal * torch.exp(-w_n) + w_n)
+
+                    loss = loss + loss_prior
         loss.backward()
+
+        # When frozen, zero w_ gradients so they stay at w=0 (unit weighting)
+        if freeze_uncertainty_weights:
+            for w_param in (gaussians._w_albedo, gaussians._w_metallic, gaussians._w_normal):
+                if w_param.grad is not None:
+                    w_param.grad.zero_()
+
         iter_end.record()
 
         if iteration % 500 == 0:
@@ -425,23 +466,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print(f"\n[ITER {iteration}] EnvMap Stats — Min: {hdr_base.min().item():.4f}, Max: {hdr_base.max().item():.4f}, Mean: {hdr_base.mean().item():.4f}")
                 
                 print(f"[ITER {iteration}] Extended Loss — albedo_gt: {loss_albedo_gt_val.item():.4f}, normal_gt: {loss_normal_gt_val.item():.4f}, metallic_gt: {loss_metallic_gt_val.item():.4f}")
+                w_a, w_m, w_n = gaussians._w_albedo.item(), gaussians._w_metallic.item(), gaussians._w_normal.item()
+                print(f"[ITER {iteration}] Uncertainty w — albedo: {w_a:.4f} (eff: {torch.exp(-gaussians._w_albedo).item():.4f}), "
+                      f"metallic: {w_m:.4f} (eff: {torch.exp(-gaussians._w_metallic).item():.4f}), "
+                      f"normal: {w_n:.4f} (eff: {torch.exp(-gaussians._w_normal).item():.4f})")
                 
-                loss_log_path = os.path.join(scene.model_path, "train_process", "loss_components.json")
                 loss_entry = {
                     "iteration": iteration,
                     "albedo_gt": loss_albedo_gt_val.item(),
                     "normal_gt": loss_normal_gt_val.item(),
-                    "metallic_gt": loss_metallic_gt_val.item()
+                    "metallic_gt": loss_metallic_gt_val.item(),
+                    "w_albedo": gaussians._w_albedo.item(),
+                    "w_metallic": gaussians._w_metallic.item(),
+                    "w_normal": gaussians._w_normal.item(),
                 }
-                
-                loss_logs = []
-                if os.path.exists(loss_log_path):
-                    with open(loss_log_path, "r") as f:
-                        try:
-                            loss_logs = json.load(f)
-                        except json.JSONDecodeError:
-                            loss_logs = []
                 loss_logs.append(loss_entry)
+                os.makedirs(os.path.dirname(loss_log_path), exist_ok=True)
                 with open(loss_log_path, "w") as f:
                     json.dump(loss_logs, f, indent=2)
 
@@ -460,8 +500,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
+            # Densification (do not densify or reset opacity on the very last iteration)
+            if iteration < opt.densify_until_iter and iteration < opt.iterations:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -594,6 +634,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_normal_gt", type=float, default=0.1, help="Weight for normal GT loss")
     parser.add_argument("--lambda_metallic_gt", type=float, default=0.05, help="Weight for metallic GT loss")
     parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
+    parser.add_argument("--freeze_uncertainty_weights", action="store_true", default=False, help="Keep Kendall uncertainty weights frozen at w=0 (unit weighting) for A/B comparison")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -605,7 +646,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss, args.freeze_uncertainty_weights)
 
     # All done
     print("\nTraining complete.")
