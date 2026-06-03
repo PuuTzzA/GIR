@@ -21,6 +21,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.ir_utils import linear_to_srgb, sample_diffuse_directions, dot
+import torch.nn.functional as F
 import nvdiffrast.torch as dr
 import envlight
 from einops import rearrange
@@ -66,6 +67,8 @@ class GaussianModel:
             np.fromfile("load/lights/bsdf_256_256.bin", dtype=np.float32).reshape(
                 1, 256, 256, 2
             )).cuda()
+        # Pre-permute to NCHW once so compute_color never re-allocates it
+        self.FG_LUT_nchw = self.FG_LUT.permute(0, 3, 1, 2).contiguous()
         self.grid = torch.empty(0)
         self.min_pts = torch.empty(0)
         self.max_pts = torch.empty(0)
@@ -289,7 +292,7 @@ class GaussianModel:
         with torch.no_grad():
             self.get_grid()
             normal = self.get_eigenvector
-            self.diffuse_occ = torch.zeros((self.get_xyz.shape[0], self.diffuse_sample_num), device=normal.device)
+            self.diffuse_occ = torch.zeros((self.get_xyz.shape[0], self.diffuse_sample_num), dtype=torch.bool, device=normal.device)
             diffuse_directions = sample_diffuse_directions(normal, self.diffuse_direction_samples, is_train=False)
             xyz = self.get_xyz
             distances = torch.norm(xyz, dim=1)
@@ -297,6 +300,8 @@ class GaussianModel:
             sam_pts_num = 128
             chunk_size = 4096  # Process points in chunks to avoid OOM
             P = xyz.shape[0]
+            # Pre-compute the un-scaled sample positions once (avoids per-chunk-per-dir allocation)
+            _z_base = torch.linspace(0, 1, sam_pts_num)[16:].cuda().unsqueeze(0)  # [1, 112]
             for i in range(self.diffuse_sample_num):
                 dirs = diffuse_directions[:,i,:]
                 for start in range(0, P, chunk_size):
@@ -304,19 +309,18 @@ class GaussianModel:
                     xyz_chunk = xyz[start:end]
                     dirs_chunk = dirs[start:end]
                     max_dist = self.get_sphere_intersection(xyz_chunk, dirs_chunk, max_radiu)
-                    z_vals = torch.linspace(0, 1, sam_pts_num)[16:].cuda()
-                    z_vals = max_dist * z_vals.unsqueeze(0)
+                    z_vals = _z_base * max_dist  # reuse pre-computed base
                     pts_sample = z_vals.unsqueeze(-1) * dirs_chunk.unsqueeze(-2) + xyz_chunk.unsqueeze(-2)
                     pts_weight = self.query_pts_value(pts_sample)
                     pts_weight = torch.sum(pts_weight, dim=-1)
-                    self.diffuse_occ[start:end, i] = (pts_weight > 1).float()
+                    self.diffuse_occ[start:end, i] = (pts_weight > 1)  # store as bool
 
     def compute_color(self, camera_center, iteration=None, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, exposure=0.0):
         means3D = self.get_xyz
         if remove_noise:
             v = camera_center - means3D
             dis = torch.sum(v * v, dim=-1)
-            xyz_mask = torch.where(dis > 1.25, torch.tensor(1.0, device="cuda"), torch.tensor(0.0, device="cuda"))
+            xyz_mask = (dis > 1.25).float()
             self._xyz.data = self._xyz.data * xyz_mask.unsqueeze(-1)
             means3D = self.get_xyz
 
@@ -348,9 +352,8 @@ class GaussianModel:
         prefix_shape = albedo.shape[:-1]
         diffuse_albedo = (1 - metallic) * albedo
         fg_uv = torch.cat([n_dot_v, roughness], -1).clamp(0, 1)
-        # --- THE ULTIMATE PYTORCH BYPASS ---
-        import torch.nn.functional as F
-        lut = self.get_FG_LUT.permute(0, 3, 1, 2) # Convert to PyTorch layout [1, 2, 256, 256]
+        # --- FG-LUT sampling (uses cached NCHW view, zero re-allocation per step) ---
+        lut = self.FG_LUT_nchw  # [1, 2, 256, 256] pre-computed in __init__
         
         # Convert OpenGL (0 to 1) coordinates to PyTorch (-1 to 1) coordinates
         u = fg_uv[:, 0] * 2.0 - 1.0
@@ -381,7 +384,7 @@ class GaussianModel:
                     dz = chunk_dirs[:,2].unsqueeze(-1)
                     chunk_dirs = torch.cat([-dy, dz, -dx], dim=-1)
                 chunk_light = envlight(chunk_dirs)
-                chunk_occ = rearrange(self.diffuse_occ[pstart:pend], "B N -> (B N)").unsqueeze(1)
+                chunk_occ = rearrange(self.diffuse_occ[pstart:pend].float(), "B N -> (B N)").unsqueeze(1)
                 chunk_light = (1 - chunk_occ) * chunk_light
                 chunk_light = rearrange(chunk_light, "(B N) C -> B N C", N=self.diffuse_sample_num)
                 diffuse_light[pstart:pend] = torch.mean(chunk_light, dim=1)
@@ -405,7 +408,7 @@ class GaussianModel:
             specular_color = specular_light * specular_albedo
 
         color = linear_to_srgb((diffuse_color + specular_color)*2**exposure).clamp(0.0, 1.0)
-        mask = torch.where(n_dot_v > 0, torch.tensor(1.0, device="cuda"), torch.tensor(0.0, device="cuda"))
+        mask = (n_dot_v > 0).float()
         mask2 = (torch.rand_like(mask) < 0.3).float()
         if is_train and iteration > (first_stage_step+5000):
                 color = color * mask + torch.rand_like(color) * (1 - mask) * mask2
@@ -494,7 +497,8 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self.diffuse_occ = torch.ones((fused_point_cloud.shape[0], self.diffuse_sample_num), device="cuda")
+        # Store as bool (1 byte/element vs 4 bytes for float32) – cast to float when used in arithmetic
+        self.diffuse_occ = torch.ones((fused_point_cloud.shape[0], self.diffuse_sample_num), dtype=torch.bool, device="cuda")
 
         self._albedo_init = nn.Parameter(fused_color.requires_grad_(True))
         self._metallic_init = nn.Parameter(metallic.requires_grad_(True))
@@ -721,7 +725,10 @@ class GaussianModel:
         self._albedo_init = optimizable_tensors["albedo_init"]
         self._metallic_init = optimizable_tensors["metallic_init"]
         self._roughness_init = optimizable_tensors["roughness_init"]
-        self.diffuse_occ = self.diffuse_occ[valid_points_mask]
+        # Free old buffer **before** assigning the indexed result to reduce peak memory
+        _new_occ = self.diffuse_occ[valid_points_mask]
+        self.diffuse_occ = None
+        self.diffuse_occ = _new_occ
 
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
@@ -775,7 +782,10 @@ class GaussianModel:
         self._albedo_init = optimizable_tensors["albedo_init"]
         self._metallic_init = optimizable_tensors["metallic_init"]
         self._roughness_init = optimizable_tensors["roughness_init"]
-        self.diffuse_occ = torch.cat([self.diffuse_occ, new_diffuse_occ], 0)
+        # Free old buffer before concat to reduce peak allocation
+        _new_occ = torch.cat([self.diffuse_occ, new_diffuse_occ], 0)
+        self.diffuse_occ = None
+        self.diffuse_occ = _new_occ
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

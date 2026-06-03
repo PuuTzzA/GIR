@@ -108,6 +108,12 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         
         self.random_background = False
+
+        # GT material supervision loss weights (set > 0 to enable)
+        self.lambda_albedo = 0.0
+        self.lambda_normal = 0.0
+        self.lambda_metallic = 0.0
+        self.gt_loss_type = "l1"
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

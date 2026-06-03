@@ -1,4 +1,5 @@
 #include <float.h>
+#include <float.h>
 /*
  * Copyright (C) 2023, Inria
  * GRAPHDECO research group, https://team.inria.fr/graphdeco

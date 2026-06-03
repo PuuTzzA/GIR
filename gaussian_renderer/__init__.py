@@ -11,6 +11,7 @@
 
 import torch
 import math
+from contextlib import nullcontext
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import RGB2SH
@@ -142,63 +143,50 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rendered_specular_direct_light = None
     rendered_specular_direct_color = None
     rendered_occ = None
-    if iteration > second_stage_step:
-        render_normal = (pc.get_eigenvector + 1) / 2
-        render_material = torch.cat([pc.get_metallic_init, pc.get_roughness_init.clamp(0.08, 0.5), torch.zeros((render_normal.shape[0],1), device="cuda")], -1)
-        rendered_normal, _, _, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = render_normal,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-        rendered_material, _, _, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = render_material,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-        rendered_metallic = rendered_material[0:1,...].repeat(3,1,1)
-        rendered_roughness = rendered_material[1:2,...].repeat(3,1,1)
-        rendered_albedo, _, _, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = albedo,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-    elif iteration > first_stage_step:
-        if iteration % 500 == 0:
-            with torch.no_grad():
-                render_normal = (pc.get_eigenvector + 1) / 2
-                render_material = torch.cat([pc.get_metallic_init, pc.get_roughness_init.clamp(0.08, 0.5), torch.zeros((render_normal.shape[0],1), device="cuda")], -1)
-                rendered_normal, _, _, _ = rasterizer(
+    # Always render G-buffers (normal, metallic, roughness) by splatting per-Gaussian
+    # material properties as "colors" through the standard rasterizer.
+    # This works because the rasterizer alpha-composites any 3-channel per-Gaussian
+    # attribute into a 2D image — we just substitute material props for RGB.
+    if iteration > first_stage_step:
+        # Render G-buffers: use no_grad if not in the loss-critical second stage 
+        ctx = torch.no_grad() if iteration <= second_stage_step else nullcontext()
+        with ctx:
+            # Normal: map from [-1,1] to [0,1] for visualization
+            render_normal = (pc.get_eigenvector + 1) / 2
+            # Material: pack metallic (ch0), roughness (ch1), zeros (ch2) into a 3-channel attribute
+            render_material = torch.cat([pc.get_metallic_init, pc.get_roughness_init.clamp(0.08, 0.5), torch.zeros((render_normal.shape[0],1), device="cuda")], -1)
+            rendered_normal, _, _, _ = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                shs = shs,
+                colors_precomp = render_normal,
+                opacities = opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+            rendered_material, _, _, _ = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                shs = shs,
+                colors_precomp = render_material,
+                opacities = opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+            rendered_metallic = rendered_material[0:1,...]  # keep 1-channel; expand only if needed for save
+            rendered_roughness = rendered_material[1:2,...]  # keep 1-channel
+            # Albedo: splat the per-Gaussian albedo attribute
+            if iteration > second_stage_step:
+                rendered_albedo, _, _, _ = rasterizer(
                     means3D = means3D,
                     means2D = means2D,
                     shs = shs,
-                    colors_precomp = render_normal,
+                    colors_precomp = albedo,
                     opacities = opacity,
                     scales = scales,
                     rotations = rotations,
                     cov3D_precomp = cov3D_precomp)
-                rendered_material, _, _, _ = rasterizer(
-                    means3D = means3D,
-                    means2D = means2D,
-                    shs = shs,
-                    colors_precomp = render_material,
-                    opacities = opacity,
-                    scales = scales,
-                    rotations = rotations,
-                    cov3D_precomp = cov3D_precomp)
-                rendered_metallic = rendered_material[0:1,...].repeat(3,1,1)
-                rendered_roughness = rendered_material[1:2,...].repeat(3,1,1)
+            elif 'albedo' in dir():
                 rendered_albedo, _, _, _ = rasterizer(
                     means3D = means3D,
                     means2D = means2D,

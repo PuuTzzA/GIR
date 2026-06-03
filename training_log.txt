@@ -1,0 +1,58 @@
+(base) tputzer@VC18:~/PBR-3DGS$ cd GIR
+(base) tputzer@VC18:~/PBR-3DGS/GIR$ python run_training.py
+Traceback (most recent call last):
+  File "/home/tputzer/PBR-3DGS/GIR/run_training.py", line 45, in <module>
+    from train import training
+  File "/home/tputzer/PBR-3DGS/GIR/train.py", line 13, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+(base) tputzer@VC18:~/PBR-3DGS/GIR$ python run_training.py
+Traceback (most recent call last):
+  File "/home/tputzer/PBR-3DGS/GIR/run_training.py", line 45, in <module>
+    from train import training
+  File "/home/tputzer/PBR-3DGS/GIR/train.py", line 13, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+(base) tputzer@VC18:~/PBR-3DGS/GIR$ python run_training.py
+Traceback (most recent call last):
+  File "/home/tputzer/PBR-3DGS/GIR/run_training.py", line 45, in <module>
+    from train import training
+  File "/home/tputzer/PBR-3DGS/GIR/train.py", line 13, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+(base) tputzer@VC18:~/PBR-3DGS/GIR$ conda activate gir
+(gir) tputzer@VC18:~/PBR-3DGS/GIR$ python run_training.py
+Input dataset:   /home/tputzer/PBR-3DGS/data/lego
+Output model:    /home/tputzer/PBR-3DGS/outputs/output_lego_baseline
+Lambda albedo:   0.0
+Lambda normal:   0.0
+Lambda metallic: 0.0
+GT loss type:    l1
+Optimizing ../outputs/output_lego_baseline
+Output folder: ../outputs/output_lego_baseline [24/05 00:53:49]
+Found transforms_train.json file, assuming Blender data set! [24/05 00:53:49]
+Reading Training Transforms [24/05 00:53:49]
+Reading Test Transforms [24/05 00:53:56]
+Loading Training Cameras [24/05 00:54:08]
+Loading Test Cameras [24/05 00:54:10]
+Number of points at initialisation :  100000 [24/05 00:54:12]
+Training progress:   8%|████████████▋                                                                                                                                           | 4990/60000 [01:09<12:02, 76.17it/s, Loss=0.0140968
+]Traceback (most recent call last):
+  File "/home/tputzer/PBR-3DGS/GIR/run_training.py", line 82, in <module>
+    training(
+  File "/home/tputzer/PBR-3DGS/GIR/train.py", line 249, in training
+    gbuf_render_pkg = render(viewpoint_cam, gaussians, pipe, background,
+  File "/home/tputzer/PBR-3DGS/GIR/gaussian_renderer/__init__.py", line 105, in render
+    result = pc.compute_color(viewpoint_camera.camera_center, iteration, is_train, first_stage_step, second_stage_step, remove_noise, hdr_rotation, viewpoint_camera.exposure)
+  File "/home/tputzer/PBR-3DGS/GIR/scene/gaussian_model.py", line 339, in compute_color
+    occ = self.compute_occlusion(n_dot_v, reflective)
+  File "/home/tputzer/PBR-3DGS/GIR/scene/gaussian_model.py", line 251, in compute_occlusion
+    pw = self.query_pts_value(pts_sample)
+  File "/home/tputzer/PBR-3DGS/GIR/scene/gaussian_model.py", line 200, in query_pts_value
+    normalized_pc = (points - self.min_pts) / (self.max_pts - self.min_pts)
+RuntimeError: The size of tensor a (3) must match the size of tensor b (0) at non-singleton dimension 2
+Training progress:   8%|████████████▋                                                                                                                                           | 4990/60000 [01:09<12:43, 72.03it/s, Loss=0.0140968
+]
+(gir) tputzer@VC18:~/PBR-3DGS/GIR$ tmux capture-pane -t gir -pS -10000 > ~/training_log.txt
+(gir) tputzer@VC18:~/PBR-3DGS/GIR$ tmux capture-pane -t gir -pS -10000 > ./training_log.txt
+

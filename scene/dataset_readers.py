@@ -16,6 +16,7 @@ from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+import re
 import numpy as np
 import json
 from pathlib import Path
@@ -35,6 +36,12 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     exposure: float
+    albedo_prior: np.array = None
+    normal_prior: np.array = None
+    metallic_prior: np.array = None
+    roughness_prior: np.array = None
+    albedo_gt: np.array = None
+    normal_gt: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud

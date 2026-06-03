@@ -1,3 +1,5 @@
+nvdiffrast/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -48,3 +50,30 @@ events.out.tfevents.*
 
 # OS
 Thumbs.db
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/.ninja_deps
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/.ninja_log
+/nvdiffrast/build/lib.linux-x86_64-cpython-310/nvdiffrast/torch/__init__.py
+/nvdiffrast/build/lib.linux-x86_64-cpython-310/nvdiffrast/__init__.py
+/nvdiffrast/build/lib.linux-x86_64-cpython-310/_nvdiffrast_c.cpython-310-x86_64-linux-gnu.so
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/antialias.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/cudaraster/impl/Buffer.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/build.ninja
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/common.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/cudaraster/impl/CudaRaster.o
+/nvdiffrast/nvdiffrast.egg-info/dependency_links.txt
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/interpolate.o
+/nvdiffrast/build/lib.linux-x86_64-cpython-310/nvdiffrast/torch/ops.py
+/nvdiffrast/nvdiffrast.egg-info/PKG-INFO
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/cudaraster/impl/RasterImpl.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/cudaraster/impl/RasterImpl_kernel.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/rasterize.o
+/nvdiffrast/nvdiffrast.egg-info/requires.txt
+/nvdiffrast/nvdiffrast.egg-info/SOURCES.txt
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/texture.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/common/texture_kernel.o
+/nvdiffrast/nvdiffrast.egg-info/top_level.txt
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/torch/torch_antialias.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/torch/torch_bindings.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/torch/torch_interpolate.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/torch/torch_rasterize.o
+/nvdiffrast/build/temp.linux-x86_64-cpython-310/csrc/torch/torch_texture.o

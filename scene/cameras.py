@@ -17,7 +17,9 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", exposure=0.0
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", exposure=0.0,
+                 albedo_prior=None, normal_prior=None, metallic_prior=None, roughness_prior=None,
+                 albedo_gt=None, normal_gt=None
                  ):
         super(Camera, self).__init__()
 
@@ -56,6 +58,16 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        # Preserve the foreground alpha mask (1=foreground, 0=background) for masked losses
+        # Kept on CPU to save GPU memory — moved to GPU on-demand in training loop
+        self.gt_alpha_mask = gt_alpha_mask.cpu() if gt_alpha_mask is not None else torch.ones((1, self.image_height, self.image_width))
+        # Store prior/GT maps on CPU (C, H, W) — moved to GPU only when needed
+        self.albedo_prior = albedo_prior.clamp(0.0, 1.0) if albedo_prior is not None else None
+        self.normal_prior = normal_prior.clamp(0.0, 1.0) if normal_prior is not None else None
+        self.metallic_prior = metallic_prior.clamp(0.0, 1.0) if metallic_prior is not None else None
+        self.roughness_prior = roughness_prior.clamp(0.0, 1.0) if roughness_prior is not None else None
+        self.albedo_gt = albedo_gt.clamp(0.0, 1.0) if albedo_gt is not None else None
+        self.normal_gt = normal_gt.clamp(0.0, 1.0) if normal_gt is not None else None
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -30,7 +30,7 @@ except ImportError:
 import torchvision
 from envlight.utils import cubemap_to_latlong
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, lambda_albedo=0.0, lambda_normal=0.0, lambda_metallic=0.0, gt_loss_type="l1"):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -109,7 +109,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rendered_occ = render_pkg["rendered_occ"]
         viewspace_point_tensor = render_pkg["viewspace_points"]
         visibility_filter = render_pkg["visibility_filter"]
-        radii = render_pkg["radii"] 
+        radii = render_pkg["radii"]
+        del render_pkg  # Free the dictionary reference to allow GC of unused buffers
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         gt_image, gt_mask = get_mask(gt_image)        
@@ -124,6 +125,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_metallic = tv_loss(rendered_metallic) * reg_material_weight
             loss_roughness = tv_loss(rendered_roughness) * reg_material_weight
             loss = loss + loss_albedo + loss_normal + loss_metallic + loss_roughness + loss_regularizer #+ Ll1_alpha
+        # ========== GT Material Supervision Losses (masked to foreground only) ==========
+        # Entirely skipped when all lambdas are 0 (baseline mode) to save GPU memory.
+        if lambda_albedo > 0 or lambda_normal > 0 or lambda_metallic > 0:
+            def _masked_gt_loss(pred, target, mask, n_fg_pixels):
+                diff = pred - target
+                if gt_loss_type == "huber":
+                    per_pixel = torch.nn.functional.huber_loss(pred, target, reduction='none', delta=0.1)
+                else:  # "l1"
+                    per_pixel = torch.abs(diff)
+                return (per_pixel * mask).sum() / (n_fg_pixels * pred.shape[0])
+            fg_mask = viewpoint_cam.gt_alpha_mask.cuda()  # (1, H, W), 1=foreground
+            n_fg = fg_mask.sum().clamp(min=1.0)  # avoid div-by-zero
+            if lambda_albedo > 0 and rendered_albedo is not None and viewpoint_cam.albedo_gt is not None:
+                gt_albedo = viewpoint_cam.albedo_gt.cuda()
+                loss = loss + lambda_albedo * _masked_gt_loss(rendered_albedo, gt_albedo, fg_mask, n_fg)
+            if lambda_normal > 0 and rendered_normal is not None and viewpoint_cam.normal_gt is not None:
+                gt_normal = viewpoint_cam.normal_gt.cuda()
+                loss = loss + lambda_normal * _masked_gt_loss(rendered_normal, gt_normal, fg_mask, n_fg)
+            if lambda_metallic > 0 and rendered_metallic is not None:
+                zero_metallic = torch.zeros_like(rendered_metallic)
+                loss = loss + lambda_metallic * _masked_gt_loss(rendered_metallic, zero_metallic, fg_mask, n_fg)
+            del fg_mask
         loss.backward()
         iter_end.record()
 
@@ -155,11 +178,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 metallic_path = os.path.join(scene.model_path, "train_process", "metallic")
                 os.makedirs(metallic_path, exist_ok=True)
-                torchvision.utils.save_image(rendered_metallic.detach().cpu(), os.path.join(metallic_path, '{0:05d}'.format(iteration) + ".png"))
+                torchvision.utils.save_image(rendered_metallic.expand(3,-1,-1).detach().cpu(), os.path.join(metallic_path, '{0:05d}'.format(iteration) + ".png"))
 
                 roughness_path = os.path.join(scene.model_path, "train_process", "roughness")
                 os.makedirs(roughness_path, exist_ok=True)
-                torchvision.utils.save_image(rendered_roughness.detach().cpu(), os.path.join(roughness_path, '{0:05d}'.format(iteration) + ".png"))
+                torchvision.utils.save_image(rendered_roughness.expand(3,-1,-1).detach().cpu(), os.path.join(roughness_path, '{0:05d}'.format(iteration) + ".png"))
 
                 hdr_path = os.path.join(scene.model_path, "train_process", "hdr")
                 os.makedirs(hdr_path, exist_ok=True)
@@ -212,6 +235,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torchvision.utils.save_image(rendered_occ.detach().cpu(), os.path.join(occ_path, '{0:05d}'.format(iteration) + ".png"))
             
 
+        # === Save intermediate renders + point cloud every 5000 iterations ===
+        if iteration % 5000 == 0 and iteration > 0:
+            with torch.no_grad():
+                intermediate_dir = os.path.join(scene.model_path, "intermediate_renders", f"iter_{iteration}")
+                os.makedirs(intermediate_dir, exist_ok=True)
+                # Save RGB from the training render (already computed above)
+                torchvision.utils.save_image(image.clamp(0.0, 1.0).detach().cpu(), os.path.join(intermediate_dir, "rgb.png"))
+                # Save G-buffers from the training render (None during first stage, available after)
+                if rendered_albedo is not None:
+                    torchvision.utils.save_image(rendered_albedo.clamp(0.0, 1.0).detach().cpu(), os.path.join(intermediate_dir, "albedo.png"))
+                if rendered_normal is not None:
+                    torchvision.utils.save_image(rendered_normal.clamp(0.0, 1.0).detach().cpu(), os.path.join(intermediate_dir, "normal.png"))
+                if rendered_metallic is not None:
+                    torchvision.utils.save_image(rendered_metallic.expand(3,-1,-1).clamp(0.0, 1.0).detach().cpu(), os.path.join(intermediate_dir, "metallic.png"))
+                if rendered_roughness is not None:
+                    torchvision.utils.save_image(rendered_roughness.expand(3,-1,-1).clamp(0.0, 1.0).detach().cpu(), os.path.join(intermediate_dir, "roughness.png"))
+                # Save point cloud (for re-rendering later)
+                gaussians.save_ply(os.path.join(intermediate_dir, "point_cloud.ply"))
+                # Save full checkpoint (Gaussian params + envlight state for re-rendering)
+                torch.save((gaussians.capture(), iteration), os.path.join(intermediate_dir, "checkpoint.pth"))
+                print(f"\n[ITER {iteration}] Saved renders + point cloud + checkpoint to {intermediate_dir}")
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -343,7 +387,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.lambda_albedo, args.lambda_normal, args.lambda_metallic, args.gt_loss_type)
 
     # All done
     print("\nTraining complete.")
