@@ -91,7 +91,7 @@ COLMAP Dataset
 
 ---
 
-## 2. Training and Evalution
+## 2. Training and Evaluation
 The training and evaluation commands for each dataset are provided in the shell scripts located in the `scripts` folder.
     
 The basic training and testing commands are shown below.
@@ -105,6 +105,61 @@ python render.py -m $model_dir --skip_train --save_name "render" -w --hdr_rotati
     
 # relighting
 python render.py -m $model_dir --skip_train --save_name ${hdr_list_name%.*} -w --hdr_rotation --environment_texture $hdr_dir --render_relight
+```
+
+### Evaluation Loop
+
+During training (`train.py`), the model periodically runs an evaluation loop (every `--eval_interval` iterations, defaulting to 2000, and at the end of training) to monitor optimization quality.
+
+1. **Standard Metrics Evaluation**:
+   - Computes standard reconstruction quality metrics: **PSNR**, **SSIM**, **LPIPS**, **L1**, and **MSE** on the `test` cameras and a sample of `train` cameras.
+   - If material/normal ground truths (data priors) are available, it computes additional priors metrics: **Albedo PSNR**, **Albedo SSIM**, **Albedo L1**, and **Normal Angular Error**.
+   - Periodically saves side-by-side comparison grids (renders next to ground truths) for standard views to `<model_path>/eval_visuals/{test|train}/`.
+
+2. **Relighting Performance Evaluation**:
+   - **Alternate-Step Evaluation**: Executed on every second evaluation step (starting from the second evaluation iteration).
+   - Under custom environment maps, it temporarily swaps out the environment light (`gaussians.envlight`) using the `.hdr` files in the dataset's `hdris` directory, without performing disk/CLI script calls.
+   - Renders the scene under the target environment maps and compares it with the corresponding ground truth relighted views (from the `rgba_{hdri_name}` folders).
+   - Computes **PSNR** and **SSIM** for each target HDRI.
+   - Saves individual render and ground truth images under `<model_path>/eval_visuals/relight_{hdri_name}/` using original view names for better traceability.
+   - **Target HDRIs**: Customizable using `--eval_relight_hdris` (defaults to `snowy_forest`, `moonless_night`, and `fireplace`). If these are not available in the dataset, the loop automatically falls back to other available HDRIs in the dataset.
+
+3. **PDF Report Generation**:
+   - Once training completes, a PDF report (`training_report.pdf`) is automatically generated. It includes:
+     - Metrics tables for the final iteration.
+     - Plots of the evolution of rendering performance (PSNR/SSIM/LPIPS) and loss component curves.
+     - Visual comparison pages containing side-by-side renderings and ground truths for both standard and relighted views.
+
+---
+
+### Outputs Folder Structure
+
+A training run saves its results to the model path directory (configured via `-m` / `--model_path` or auto-generated under `./output/<uuid>/`). The structure of the output folder is as follows:
+
+```
+[model_path]
+|--- cfg_args                       # Config arguments namespace string
+|--- chkpnt<iteration>.pth          # PyTorch checkpoint files saved at checkpoint iterations
+|--- metrics_log.json               # JSON log of evaluation metrics per iteration
+|--- training_report.pdf            # PDF training report summarizing metrics, plots, and visuals
+|--- point_cloud/
+|    |--- iteration_<iteration>/
+|         |--- point_cloud.ply      # Exported 3D Gaussian Splatting point cloud file
+|--- train_process/
+|    |--- loss_components.json      # JSON log of loss component values per iteration
+|    |--- renders/                  # Rendered training frames
+|    |--- gt/                       # Ground truth training frames
+|    |--- normal/                   # Predicted normal maps (if priors/stage active)
+|    |--- albedo/                   # Predicted albedo maps (if priors/stage active)
+|    |--- metallic/                 # Predicted metallic maps (if priors/stage active)
+|    |--- roughness/                # Predicted roughness maps (if priors/stage active)
+|    |--- ...                       # Other decomposed material / depth maps
+|--- eval_visuals/
+|    |--- test/                     # Comparison grids of standard renders vs test ground truth
+|    |--- train/                    # Comparison grids of standard renders vs train ground truth
+|    |--- relight_<hdri_name>/      # Separate renders and ground truths under custom HDRIs:
+|         |--- iter<iteration>_<view_name>_render.png
+|         |--- iter<iteration>_<view_name>_gt.png
 ```
     
 

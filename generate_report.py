@@ -110,6 +110,10 @@ def generate_report(model_path):
 
     report_path = os.path.join(model_path, "training_report.pdf")
 
+    # Collect all relighting keys
+    relight_psnr_keys = sorted(list({k for entry in metrics_log for k in entry.keys() if k.startswith("relight_") and k.endswith("_psnr")}))
+    relight_ssim_keys = sorted(list({k for entry in metrics_log for k in entry.keys() if k.startswith("relight_") and k.endswith("_ssim")}))
+
     # Try to read config
     cfg_text = ""
     cfg_path = os.path.join(model_path, "cfg_args")
@@ -203,6 +207,19 @@ def generate_report(model_path):
                 f"{test_val:.4f}" if test_val is not None else "N/A",
                 f"{train_val:.4f}" if train_val is not None else "N/A",
             ])
+
+        # Add relighting final metrics to the table
+        for key in relight_psnr_keys:
+            hdri_name = key.replace("relight_", "").replace("_psnr", "")
+            psnr_val = final.get(key, None)
+            ssim_val = final.get(f"relight_{hdri_name}_ssim", None)
+            psnr_str = f"{psnr_val:.4f}" if psnr_val is not None else "N/A"
+            ssim_str = f"{ssim_val:.4f}" if ssim_val is not None else "N/A"
+            table_data.append([
+                f"Relight {hdri_name}",
+                f"PSNR: {psnr_str}\nSSIM: {ssim_str}",
+                "—"
+            ])
         if "train_loss" in final:
             table_data.append(["Train Loss", f"{final['train_loss']:.6f}", "—"])
         if "num_gaussians" in final:
@@ -225,6 +242,40 @@ def generate_report(model_path):
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
+
+        # ── Page 4: Relighting Metrics ─────────────────────────────
+        if relight_psnr_keys or relight_ssim_keys:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 8.5))
+            fig.suptitle("Relighting Performance Over Training", fontsize=14, fontweight="bold", y=0.98)
+            fig.patch.set_facecolor("#FAFAFA")
+
+            # Plot PSNR
+            ax_psnr = axes[0]
+            for key in relight_psnr_keys:
+                hdri_name = key.replace("relight_", "").replace("_psnr", "")
+                iters, vals = _extract(metrics_log, key)
+                if iters:
+                    ax_psnr.plot(iters, vals, "o-", markersize=3, linewidth=1.5, label=hdri_name)
+            ax_psnr.set_xlabel("Iteration")
+            ax_psnr.set_ylabel("PSNR (dB)")
+            ax_psnr.set_title("Relighting PSNR ↑")
+            ax_psnr.legend(loc="best")
+
+            # Plot SSIM
+            ax_ssim = axes[1]
+            for key in relight_ssim_keys:
+                hdri_name = key.replace("relight_", "").replace("_ssim", "")
+                iters, vals = _extract(metrics_log, key)
+                if iters:
+                    ax_ssim.plot(iters, vals, "s--", markersize=3, linewidth=1.5, label=hdri_name)
+            ax_ssim.set_xlabel("Iteration")
+            ax_ssim.set_ylabel("SSIM")
+            ax_ssim.set_title("Relighting SSIM ↑")
+            ax_ssim.legend(loc="best")
+
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
 
         # ── Page 4+: Visual comparisons ───────────────────────────────
         vis_dir = os.path.join(model_path, "eval_visuals")
@@ -266,6 +317,70 @@ def generate_report(model_path):
                         ax.axis("off")
                         view_name = os.path.basename(img_path).replace(".png", "").split("_")[-1]
                         ax.set_title(f"Render | GT  ({view_name})", fontsize=9)
+
+                    fig.tight_layout(rect=[0, 0, 1, 0.95])
+                    pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+
+            # Add Relighting Visuals
+            relight_dirs = sorted(glob.glob(os.path.join(vis_dir, "relight_*")))
+            for r_dir in relight_dirs:
+                hdri_name = os.path.basename(r_dir).replace("relight_", "")
+                image_files = sorted(glob.glob(os.path.join(r_dir, "*.png")))
+                if not image_files:
+                    continue
+
+                # Group by iteration
+                iter_groups = {}
+                for img_path in image_files:
+                    fname = os.path.basename(img_path)
+                    iter_str = fname.split("_")[0].replace("iter", "")
+                    try:
+                        it = int(iter_str)
+                    except ValueError:
+                        continue
+                    iter_groups.setdefault(it, []).append(img_path)
+
+                for it in sorted(iter_groups.keys()):
+                    imgs = iter_groups[it]
+                    
+                    # Match renders with their corresponding GTs
+                    renders = sorted([f for f in imgs if f.endswith("_render.png")])
+                    gt_map = {os.path.basename(f).replace("_gt.png", ""): f for f in imgs if f.endswith("_gt.png")}
+                    
+                    pairs = []
+                    for r_path in renders:
+                        base_key = os.path.basename(r_path).replace("_render.png", "")
+                        if base_key in gt_map:
+                            pairs.append((r_path, gt_map[base_key]))
+
+                    if not pairs:
+                        continue
+
+                    # Plot each pair
+                    n_pairs = len(pairs)
+                    fig, axes = plt.subplots(n_pairs, 2, figsize=(8.5, 3.0 * n_pairs + 0.5))
+                    if n_pairs == 1:
+                        axes = np.expand_dims(axes, axis=0)
+
+                    fig.suptitle(f"Visual Relighting under {hdri_name} — Iteration {it:,}",
+                                 fontsize=12, fontweight="bold", y=0.98)
+                    fig.patch.set_facecolor("#FAFAFA")
+
+                    for row_idx, (r_path, gt_path) in enumerate(pairs):
+                        fname = os.path.basename(r_path)
+                        parts = fname.split("_")
+                        view_name = "_".join(parts[1:-1])  # "rgba_005"
+                        
+                        ax_r = axes[row_idx, 0]
+                        ax_r.imshow(mpimg.imread(r_path))
+                        ax_r.axis("off")
+                        ax_r.set_title(f"Render ({view_name})", fontsize=9)
+
+                        ax_g = axes[row_idx, 1]
+                        ax_g.imshow(mpimg.imread(gt_path))
+                        ax_g.axis("off")
+                        ax_g.set_title(f"Ground Truth ({view_name})", fontsize=9)
 
                     fig.tight_layout(rect=[0, 0, 1, 0.95])
                     pdf.savefig(fig, bbox_inches="tight")

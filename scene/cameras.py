@@ -18,7 +18,7 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", exposure=0.0,
-                 albedo_gt=None, normal_gt=None, metallic_gt=None
+                 albedo_gt=None, normal_gt=None, metallic_gt=None, image_path=None
                  ):
         super(Camera, self).__init__()
 
@@ -64,6 +64,7 @@ class Camera(nn.Module):
             self.metallic_gt = metallic_gt.to(self.data_device)
         else:
             self.metallic_gt = metallic_gt
+        self.image_path = image_path
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -35,7 +35,51 @@ from envlight.utils import cubemap_to_latlong
 from lpipsPyTorch import lpips as compute_lpips
 from lpipsPyTorch.modules.lpips import LPIPS
 
-def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False):
+def load_relighted_gt(viewpoint, hdri_name, white_background):
+    import os
+    import numpy as np
+    from PIL import Image
+    import torch
+    from utils.general_utils import PILtoTorch
+
+    image_path = getattr(viewpoint, "image_path", None)
+    if image_path is None:
+        return None
+
+    dir_name = os.path.dirname(image_path)
+    parent_dir = os.path.dirname(dir_name)
+    basename = os.path.basename(image_path)
+    stem, ext = os.path.splitext(basename)
+    frame_idx_str = stem.split("_")[-1]
+
+    relighted_dir = os.path.join(parent_dir, f"rgba_{hdri_name}")
+    relighted_file = f"rgba_{hdri_name}_{frame_idx_str}{ext}"
+    rel_path = os.path.join(relighted_dir, relighted_file)
+
+    if not os.path.exists(rel_path):
+        return None
+
+    # Load and preprocess
+    img = Image.open(rel_path)
+    im_data = np.array(img.convert("RGBA"))
+    bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+    norm_data = im_data / 255.0
+    arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+    arr = np.concatenate((arr, norm_data[..., 3:4]), -1)
+    img_rgba = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGBA")
+
+    # Resize to the same resolution as viewpoint.original_image
+    resolution = (viewpoint.image_width, viewpoint.image_height)
+    resized_tensor = PILtoTorch(img_rgba, resolution)
+
+    gt_image = resized_tensor[:3, ...].clamp(0.0, 1.0).to(viewpoint.data_device)
+    if resized_tensor.shape[0] == 4:
+        mask = resized_tensor[3:4, ...].to(viewpoint.data_device)
+        gt_image *= mask
+
+    return gt_image
+
+def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False, run_relighting_eval=False, eval_relight_hdris=[]):
     """Evaluate metrics on test and train cameras at the current iteration."""
     torch.cuda.empty_cache()
     lpips_model.to("cuda")
@@ -121,6 +165,109 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                 grid = torchvision.utils.make_grid([rend, gt], nrow=2, padding=4, pad_value=1.0)
                 torchvision.utils.save_image(grid, os.path.join(vis_path, f"iter{iteration:06d}_view{vi}.png"))
 
+        # Relighting evaluation (only on test cameras and at run_relighting_eval steps)
+        if config["name"] == "test" and run_relighting_eval:
+            hdris_dir = os.path.join(scene.source_path, "hdris")
+            if os.path.exists(hdris_dir):
+                hdr_files = sorted([f for f in os.listdir(hdris_dir) if f.endswith(".hdr")])
+                hdr_stems = [os.path.splitext(f)[0] for f in hdr_files]
+
+                selected_hdris = []
+                for t in eval_relight_hdris:
+                    if t in hdr_stems:
+                        dir_exists = False
+                        for split in ["train", "val", "test"]:
+                            if os.path.isdir(os.path.join(scene.source_path, split, f"rgba_{t}")):
+                                dir_exists = True
+                                break
+                        if dir_exists:
+                            selected_hdris.append(t)
+
+                for h in hdr_stems:
+                    if len(selected_hdris) >= len(eval_relight_hdris) or len(selected_hdris) >= len(hdr_stems):
+                        break
+                    if h not in selected_hdris:
+                        dir_exists = False
+                        for split in ["train", "val", "test"]:
+                            if os.path.isdir(os.path.join(scene.source_path, split, f"rgba_{h}")):
+                                dir_exists = True
+                                break
+                        if dir_exists:
+                            selected_hdris.append(h)
+
+                if selected_hdris:
+                    print(f"\nEvaluating relighting under HDRIs: {selected_hdris}")
+                    sys.stdout.flush()
+
+                    white_background = (background[0] > 0.5).item()
+
+                    for hdri_name in selected_hdris:
+                        hdri_path = os.path.join(hdris_dir, f"{hdri_name}.hdr")
+                        
+                        # Backup envlight state
+                        envlight_obj = gaussians.envlight
+                        orig_image = envlight_obj.image.clone() if hasattr(envlight_obj, "image") and envlight_obj.image is not None else None
+                        orig_base = envlight_obj.base.clone()
+                        orig_specular = [m.clone() for m in envlight_obj.specular] if hasattr(envlight_obj, "specular") and envlight_obj.specular is not None else None
+                        orig_diffuse = envlight_obj.diffuse.clone() if hasattr(envlight_obj, "diffuse") and envlight_obj.diffuse is not None else None
+
+                        relight_psnr_vals = []
+                        relight_ssim_vals = []
+                        relight_save_pairs = []
+
+                        try:
+                            # Load new HDRI and build MIPs
+                            envlight_obj.load(hdri_path)
+                            envlight_obj.build_mips()
+
+                            # Evaluate over test cameras
+                            for idx, viewpoint in enumerate(config["cameras"]):
+                                gt_relight = load_relighted_gt(viewpoint, hdri_name, white_background)
+                                if gt_relight is None:
+                                    continue
+
+                                render_pkg = render(viewpoint, gaussians, pipe, background,
+                                                    iteration=iteration, is_train=False,
+                                                    first_stage_step=first_stage_step,
+                                                    second_stage_step=second_stage_step,
+                                                    remove_noise=remove_noise,
+                                                    hdr_rotation=hdr_rotation)
+                                image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+
+                                relight_psnr_vals.append(psnr(image, gt_relight).mean().item())
+                                relight_ssim_vals.append(ssim(image, gt_relight).item())
+
+                                if save_visuals and idx < 3:
+                                    relight_save_pairs.append((viewpoint.image_name, image.detach().cpu(), gt_relight.detach().cpu()))
+
+                        finally:
+                            # Restore envlight state
+                            if orig_image is not None:
+                                envlight_obj.image = orig_image
+                            envlight_obj.base.data = orig_base
+                            if orig_specular is not None:
+                                envlight_obj.specular = orig_specular
+                            if orig_diffuse is not None:
+                                envlight_obj.diffuse = orig_diffuse
+
+                        # Store and report results
+                        if relight_psnr_vals:
+                            avg_psnr = sum(relight_psnr_vals) / len(relight_psnr_vals)
+                            avg_ssim = sum(relight_ssim_vals) / len(relight_ssim_vals)
+                            results[f"relight_{hdri_name}_psnr"] = avg_psnr
+                            results[f"relight_{hdri_name}_ssim"] = avg_ssim
+
+                            print(f"  HDRI {hdri_name:20s} — PSNR: {avg_psnr:.2f}, SSIM: {avg_ssim:.4f}")
+                            sys.stdout.flush()
+
+                        # Save visuals as separate images
+                        if save_visuals and relight_save_pairs:
+                            vis_path = os.path.join(scene.model_path, "eval_visuals", f"relight_{hdri_name}")
+                            os.makedirs(vis_path, exist_ok=True)
+                            for view_name, rend, gt in relight_save_pairs:
+                                torchvision.utils.save_image(rend, os.path.join(vis_path, f"iter{iteration:06d}_{view_name}_render.png"))
+                                torchvision.utils.save_image(gt, os.path.join(vis_path, f"iter{iteration:06d}_{view_name}_gt.png"))
+
     albedo_info = ""
     if "test_albedo_psnr" in results:
         albedo_info = f", Alb PSNR: {results['test_albedo_psnr']:.2f}, Norm Err: {results['test_normal_ang_err']:.2f} deg"
@@ -137,7 +284,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False, freeze_uncertainty_weights=False):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False, freeze_uncertainty_weights=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace']):
     # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
     # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
     user_eval_set = (eval_interval != 2000)
@@ -212,6 +359,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    eval_count = 0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -525,11 +673,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # --- Periodic evaluation ---
             if iteration % eval_interval == 0 or iteration == opt.iterations:
+                eval_count += 1
+                run_relighting_eval = (eval_count % 2 == 0)
                 save_visuals = (iteration % visual_interval == 0) or (iteration == opt.iterations)
                 eval_results = periodic_evaluation(
                     iteration, scene, gaussians, pipe, background,
                     first_stage_step, second_stage_step, remove_noise, hdr_rotation,
-                    ema_loss_for_log, lpips_model, save_visuals=save_visuals
+                    ema_loss_for_log, lpips_model, save_visuals=save_visuals,
+                    run_relighting_eval=run_relighting_eval,
+                    eval_relight_hdris=eval_relight_hdris
                 )
                 metrics_log.append(eval_results)
                 with open(metrics_log_path, "w") as f:
@@ -635,6 +787,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_metallic_gt", type=float, default=0.05, help="Weight for metallic GT loss")
     parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
     parser.add_argument("--freeze_uncertainty_weights", action="store_true", default=False, help="Keep Kendall uncertainty weights frozen at w=0 (unit weighting) for A/B comparison")
+    parser.add_argument("--eval_relight_hdris", nargs="+", type=str, default=['snowy_forest', 'moonless_night', 'fireplace'], help="List of HDRI names to evaluate relighting on")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -646,7 +799,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss, args.freeze_uncertainty_weights)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss, args.freeze_uncertainty_weights, args.eval_relight_hdris)
 
     # All done
     print("\nTraining complete.")
