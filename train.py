@@ -674,7 +674,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # --- Periodic evaluation ---
             if iteration % eval_interval == 0 or iteration == opt.iterations:
                 eval_count += 1
-                run_relighting_eval = (eval_count % 2 == 0)
+                run_relighting_eval = (eval_count % 2 == 0) or (iteration == opt.iterations)
                 save_visuals = (iteration % visual_interval == 0) or (iteration == opt.iterations)
                 eval_results = periodic_evaluation(
                     iteration, scene, gaussians, pipe, background,
