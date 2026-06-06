@@ -284,7 +284,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False, freeze_uncertainty_weights=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace']):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False, use_uncertainty_weights=True, freeze_uncertainty_weights=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace']):
     # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
     # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
     user_eval_set = (eval_interval != 2000)
@@ -477,21 +477,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_normal_gt_val = base_loss_normal.detach()
                     loss_metallic_gt_val = base_loss_metallic.detach()
 
-                    # Kendall et al. multi-task uncertainty weighting:
-                    #   L_prior = sum_i [ L_i * exp(-w_i) + w_i ]
-                    # where w_i is a learnable log-variance scalar.
-                    #
-                    # CRITICAL STABILITY POLISH: To prevent exponential overflow (exp(-w) -> infinity)
-                    # and numerical NaN crashes when base losses become extremely close to zero,
-                    # we clamp the log-variance parameters w to a safe operational range of [-5.0, 10.0].
-                    # This allows effective loss weights to scale up to exp(5.0) ≈ 148.4x down to exp(-10.0) ≈ 4.5e-5x.
-                    w_a = torch.clamp(gaussians._w_albedo, min=-5.0, max=10.0)
-                    w_m = torch.clamp(gaussians._w_metallic, min=-5.0, max=10.0)
-                    w_n = torch.clamp(gaussians._w_normal, min=-5.0, max=10.0)
+                    if use_uncertainty_weights:
+                        # Kendall et al. multi-task uncertainty weighting:
+                        #   L_prior = sum_i [ L_i * exp(-w_i) + w_i ]
+                        # where w_i is a learnable log-variance scalar. The lambda_*_gt
+                        # arguments are IGNORED in this mode; the network learns the weights.
+                        #
+                        # CRITICAL STABILITY POLISH: To prevent exponential overflow (exp(-w) -> infinity)
+                        # and numerical NaN crashes when base losses become extremely close to zero,
+                        # we clamp the log-variance parameters w to a safe operational range of [-5.0, 10.0].
+                        # This allows effective loss weights to scale up to exp(5.0) ≈ 148.4x down to exp(-10.0) ≈ 4.5e-5x.
+                        w_a = torch.clamp(gaussians._w_albedo, min=-5.0, max=10.0)
+                        w_m = torch.clamp(gaussians._w_metallic, min=-5.0, max=10.0)
+                        w_n = torch.clamp(gaussians._w_normal, min=-5.0, max=10.0)
 
-                    loss_prior = (base_loss_albedo * torch.exp(-w_a) + w_a) \
-                               + (base_loss_metallic * torch.exp(-w_m) + w_m) \
-                               + (base_loss_normal * torch.exp(-w_n) + w_n)
+                        loss_prior = (base_loss_albedo * torch.exp(-w_a) + w_a) \
+                                   + (base_loss_metallic * torch.exp(-w_m) + w_m) \
+                                   + (base_loss_normal * torch.exp(-w_n) + w_n)
+                    else:
+                        # Fixed manual weighting: scale each prior loss by its lambda_*_gt.
+                        # The learnable uncertainty weights (_w_*) are NOT used here.
+                        loss_prior = lambda_albedo_gt * base_loss_albedo \
+                                   + lambda_normal_gt * base_loss_normal \
+                                   + lambda_metallic_gt * base_loss_metallic
 
                     loss = loss + loss_prior
         loss.backward()
@@ -657,7 +665,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     alpha_ = 0.2
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent * alpha_, size_threshold)
+                    # Optional hard cap: stop *growing* the gaussian count once the cap is
+                    # reached (pruning still runs to keep memory in check). 0 = unlimited.
+                    below_cap = (opt.max_gaussians <= 0) or (gaussians.get_xyz.shape[0] < opt.max_gaussians)
+                    if below_cap:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent * alpha_, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -786,6 +798,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_normal_gt", type=float, default=0.1, help="Weight for normal GT loss")
     parser.add_argument("--lambda_metallic_gt", type=float, default=0.05, help="Weight for metallic GT loss")
     parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
+    parser.add_argument("--use_uncertainty_weights", action="store_true", default=False, help="Use learnable Kendall uncertainty weights for the prior losses. If not set, the fixed lambda_albedo_gt / lambda_normal_gt / lambda_metallic_gt weights are used instead")
     parser.add_argument("--freeze_uncertainty_weights", action="store_true", default=False, help="Keep Kendall uncertainty weights frozen at w=0 (unit weighting) for A/B comparison")
     parser.add_argument("--eval_relight_hdris", nargs="+", type=str, default=['snowy_forest', 'moonless_night', 'fireplace'], help="List of HDRI names to evaluate relighting on")
     args = parser.parse_args(sys.argv[1:])
@@ -799,7 +812,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss, args.freeze_uncertainty_weights, args.eval_relight_hdris)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss, args.use_uncertainty_weights, args.freeze_uncertainty_weights, args.eval_relight_hdris)
 
     # All done
     print("\nTraining complete.")

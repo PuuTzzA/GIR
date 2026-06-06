@@ -106,6 +106,7 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 45_000
         self.densify_grad_threshold = 0.0002
+        self.max_gaussians = 0  # hard cap on the number of gaussians (0 = unlimited)
         
         self.random_background = False
         super().__init__(parser, "Optimization Parameters")
