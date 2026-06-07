@@ -126,15 +126,14 @@ CONFIG = {
     # Priors - GT prior supervision ADDED to the engine
     # (albedo / normal / metallic priors extracted by the prior_extractors)
     # ----------------------------------------------------------------------
-    "use_uncertainty_weights": True, # default: True   | True  -> learnable Kendall weights (lambda_*_gt IGNORED)
-                                     #                  | False -> use the fixed lambda_*_gt weights below
-    "lambda_albedo_gt": 0.5,         # default: 0.5    | fixed weight for albedo GT-prior loss (only if not uncertainty)
-    "lambda_normal_gt": 0.1,         # default: 0.1    | fixed weight for normal GT-prior loss (only if not uncertainty)
-    "lambda_metallic_gt": 0.05,      # default: 0.05   | fixed weight for metallic GT-prior loss (only if not uncertainty)
+    "lambda_albedo_gt": 0.1,         # default: 0.1    | fixed weight for albedo GT-prior loss
+    "lambda_normal_gt": 0.1,         # default: 0.1    | fixed weight for normal GT-prior loss
+    "lambda_metallic_gt": 0.05,      # default: 0.05   | fixed weight for metallic GT-prior loss
+    "lambda_roughness_gt": 0.05,     # default: 0.05   | fixed weight for roughness GT-prior loss
+    "use_prior_weight_scheduler": True, # default: True  | ramp up prior and envmap weights
+    "prior_weight_scheduler_ratio": 0.15, # default: 0.15  | fraction of post-second-stage steps for warmup
     "exclude_prior_loss": False,     # default: False  | compute prior losses for logging only,
                                      #                  | but do NOT backprop them (no-prior ablation)
-    "freeze_uncertainty_weights": False,  # default: False | freeze Kendall uncertainty weights
-                                          #                | at w=0 (unit weighting) for A/B test
 
     # ----------------------------------------------------------------------
     # Logging / evaluation
@@ -195,9 +194,10 @@ def build_args():
     parser.add_argument("--lambda_albedo_gt", type=float)
     parser.add_argument("--lambda_normal_gt", type=float)
     parser.add_argument("--lambda_metallic_gt", type=float)
+    parser.add_argument("--lambda_roughness_gt", type=float)
+    parser.add_argument("--use_prior_weight_scheduler", action="store_true", default=None)
+    parser.add_argument("--prior_weight_scheduler_ratio", type=float)
     parser.add_argument("--exclude_prior_loss", action="store_true", default=None)
-    parser.add_argument("--use_uncertainty_weights", action="store_true", default=None)
-    parser.add_argument("--freeze_uncertainty_weights", action="store_true", default=None)
     parser.add_argument("--eval_relight_hdris", nargs="+", type=str)
 
     # 1. Start from engine defaults.
@@ -259,9 +259,10 @@ def main():
         args.lambda_albedo_gt,
         args.lambda_normal_gt,
         args.lambda_metallic_gt,
+        args.lambda_roughness_gt,
+        args.use_prior_weight_scheduler,
+        args.prior_weight_scheduler_ratio,
         args.exclude_prior_loss,
-        args.use_uncertainty_weights,
-        args.freeze_uncertainty_weights,
         args.eval_relight_hdris,
     )
 

@@ -78,13 +78,6 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
-        # Kendall et al. multi-task uncertainty weighting: learnable log-variance
-        # scalars for albedo, metallic, and normal prior losses.
-        # Initialized to 0.0 => exp(-w) = 1.0, i.e. unit weight at start.
-        self._w_albedo = nn.Parameter(torch.zeros(1, device="cuda"), requires_grad=True)
-        self._w_metallic = nn.Parameter(torch.zeros(1, device="cuda"), requires_grad=True)
-        self._w_normal = nn.Parameter(torch.zeros(1, device="cuda"), requires_grad=True)
-
         self.diffuse_sample_num = 128
         self.specular_sample_num = 24
         self.envlight = envlight.EnvLight(environment_texture, scale=environment_scale, min_res=16, max_res=512, min_roughness=0.08, max_roughness=0.5, trainable=True).cuda()
@@ -117,9 +110,6 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self.envlight.state_dict(),
-            self._w_albedo,
-            self._w_metallic,
-            self._w_normal,
         )
     
     def restore(self, model_args, training_args):
@@ -145,9 +135,7 @@ class GaussianModel:
             opt_dict, 
             self.spatial_lr_scale,
             envlight_state_dict,
-            self._w_albedo,
-            self._w_metallic,
-            self._w_normal) = model_args
+            *_) = model_args
         else:
             (self.active_sh_degree, 
             self._xyz, 
@@ -557,10 +545,6 @@ class GaussianModel:
             {'params': self.envlight.net.parameters(), 'lr': training_args.hdr_lr_init, "name": "hdr_net"},
             {'params': [self.envlight.init_base], 'lr': training_args.hdr_lr_init, "name": "hdr_init_base"},
             {'params': [self.envlight.base_train], 'lr': training_args.hdr_base_lr_init, "name": "hdr_base_train"},
-
-            # Kendall et al. log-variance uncertainty weights — separate group with
-            # a conservative learning rate.  These are global scalars, not per-point.
-            {'params': [self._w_albedo, self._w_metallic, self._w_normal], 'lr': 1e-4, "name": "uncertainty_weights"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -729,7 +713,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if "hdr" in group["name"] or group["name"] == "uncertainty_weights":
+            if "hdr" in group["name"]:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -771,7 +755,7 @@ class GaussianModel:
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if "hdr" in group["name"] or group["name"] == "uncertainty_weights":
+            if "hdr" in group["name"]:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]

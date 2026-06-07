@@ -110,6 +110,16 @@ def generate_report(model_path):
 
     report_path = os.path.join(model_path, "training_report.pdf")
 
+    # Load loss components to read lambda values if they exist
+    loss_path = os.path.join(model_path, "train_process", "loss_components.json")
+    loss_log = []
+    if os.path.exists(loss_path):
+        with open(loss_path, "r") as f:
+            try:
+                loss_log = json.load(f)
+            except Exception:
+                loss_log = []
+
     # Collect all relighting keys
     relight_psnr_keys = sorted(list({k for entry in metrics_log for k in entry.keys() if k.startswith("relight_") and k.endswith("_psnr")}))
     relight_ssim_keys = sorted(list({k for entry in metrics_log for k in entry.keys() if k.startswith("relight_") and k.endswith("_ssim")}))
@@ -276,6 +286,41 @@ def generate_report(model_path):
             fig.tight_layout(rect=[0, 0, 1, 0.95])
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
+
+        # ── Page 4b: Evolution of GT Prior Loss Weights (Lambdas) ─────────────
+        if loss_log:
+            iters_la, vals_la = _extract(loss_log, "lambda_albedo")
+            if iters_la:
+                fig, ax = plt.subplots(figsize=(11, 8.5))
+                fig.suptitle("Evolution of Prior Loss & Environment Map Lambdas", fontsize=14, fontweight="bold", y=0.98)
+                fig.patch.set_facecolor("#FAFAFA")
+                
+                ax.plot(iters_la, vals_la, "-", label="Albedo GT weight (lambda_albedo)", linewidth=2.5)
+                
+                _, vals_ln = _extract(loss_log, "lambda_normal")
+                if vals_ln:
+                    ax.plot(iters_la, vals_ln, "-", label="Normal GT weight (lambda_normal)", linewidth=2.5)
+                
+                _, vals_lm = _extract(loss_log, "lambda_metallic")
+                if vals_lm:
+                    ax.plot(iters_la, vals_lm, "-", label="Metallic GT weight (lambda_metallic)", linewidth=2.5)
+                
+                _, vals_lr = _extract(loss_log, "lambda_roughness")
+                if vals_lr:
+                    ax.plot(iters_la, vals_lr, "-", label="Roughness GT weight (lambda_roughness)", linewidth=2.5)
+                
+                _, vals_rh = _extract(loss_log, "lambda_reg_hdr")
+                if vals_rh:
+                    ax.plot(iters_la, vals_rh, "--", label="EnvMap regularizer weight (lambda_reg_hdr)", linewidth=2)
+                
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("Active Lambda Weight")
+                ax.set_title("Active supervision weights per iteration")
+                ax.legend(loc="best")
+                
+                fig.tight_layout(rect=[0, 0, 1, 0.95])
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
 
         # ── Page 4+: Visual comparisons ───────────────────────────────
         vis_dir = os.path.join(model_path, "eval_visuals")

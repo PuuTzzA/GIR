@@ -284,7 +284,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.5, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, exclude_prior_loss=False, use_uncertainty_weights=True, freeze_uncertainty_weights=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace']):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=True, prior_weight_scheduler_ratio=0.15, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace']):
     # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
     # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
     user_eval_set = (eval_interval != 2000)
@@ -423,9 +423,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         visibility_filter = render_pkg["visibility_filter"]
         radii = render_pkg["radii"] 
         # Loss
+        multiplier = 0.0
         loss_albedo_gt_val = torch.tensor(0.0).cuda()
         loss_normal_gt_val = torch.tensor(0.0).cuda()
         loss_metallic_gt_val = torch.tensor(0.0).cuda()
+        loss_roughness_gt_val = torch.tensor(0.0).cuda()
 
         gt_image = viewpoint_cam.original_image.cuda()
         gt_image, gt_mask = get_mask(gt_image)        
@@ -434,9 +436,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_image = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss = loss_image
         if iteration > second_stage_step:
+            multiplier = 1.0
+            if use_prior_weight_scheduler:
+                total_second_stage_steps = opt.iterations - second_stage_step
+                warmup_steps = int(prior_weight_scheduler_ratio * total_second_stage_steps)
+                progress = iteration - second_stage_step
+                if progress < warmup_steps and warmup_steps > 0:
+                    multiplier = float(progress) / float(warmup_steps)
+
             loss_albedo = tv_loss(rendered_albedo) * 0.1
             loss_normal = smooth_loss(rendered_normal, gt_image) * 0.01 # 1
-            loss_regularizer = regularizer_loss(gaussians.envlight.base) * reg_hdr_weight
+            loss_regularizer = regularizer_loss(gaussians.envlight.base) * reg_hdr_weight * multiplier
             loss_metallic = tv_loss(rendered_metallic) * reg_material_weight
             loss_roughness = tv_loss(rendered_roughness) * reg_material_weight
             loss = loss + loss_albedo + loss_normal + loss_metallic + loss_roughness + loss_regularizer #+ Ll1_alpha
@@ -446,11 +456,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_albedo = viewpoint_cam.albedo_gt
                 gt_normal = viewpoint_cam.normal_gt
                 gt_metallic_val = viewpoint_cam.metallic_gt
+                gt_roughness_val = getattr(viewpoint_cam, 'roughness_gt', None)
 
                 if isinstance(gt_metallic_val, torch.Tensor):
                     gt_metallic = gt_metallic_val
                 else:
                     gt_metallic = torch.full_like(rendered_metallic, gt_metallic_val)
+
+                if gt_roughness_val is not None:
+                    if isinstance(gt_roughness_val, torch.Tensor):
+                        gt_roughness = gt_roughness_val
+                    else:
+                        gt_roughness = torch.full_like(rendered_roughness, gt_roughness_val)
 
                 if exclude_prior_loss:
                     # Compute base losses without gradients — logging only
@@ -462,6 +479,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
                         loss_normal_gt_val = (1.0 - cos_sim).mean()
                         loss_metallic_gt_val = l1_loss(rendered_metallic, gt_metallic)
+                        if gt_roughness_val is not None:
+                            loss_roughness_gt_val = l1_loss(rendered_roughness, gt_roughness)
                 else:
                     # Compute base (unweighted) losses for each G-buffer channel
                     base_loss_albedo = (1.0 - opt.lambda_dssim) * l1_loss(rendered_albedo, gt_albedo) \
@@ -477,38 +496,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_normal_gt_val = base_loss_normal.detach()
                     loss_metallic_gt_val = base_loss_metallic.detach()
 
-                    if use_uncertainty_weights:
-                        # Kendall et al. multi-task uncertainty weighting:
-                        #   L_prior = sum_i [ L_i * exp(-w_i) + w_i ]
-                        # where w_i is a learnable log-variance scalar. The lambda_*_gt
-                        # arguments are IGNORED in this mode; the network learns the weights.
-                        #
-                        # CRITICAL STABILITY POLISH: To prevent exponential overflow (exp(-w) -> infinity)
-                        # and numerical NaN crashes when base losses become extremely close to zero,
-                        # we clamp the log-variance parameters w to a safe operational range of [-5.0, 10.0].
-                        # This allows effective loss weights to scale up to exp(5.0) ≈ 148.4x down to exp(-10.0) ≈ 4.5e-5x.
-                        w_a = torch.clamp(gaussians._w_albedo, min=-5.0, max=10.0)
-                        w_m = torch.clamp(gaussians._w_metallic, min=-5.0, max=10.0)
-                        w_n = torch.clamp(gaussians._w_normal, min=-5.0, max=10.0)
+                    # Fixed manual weighting: scale each prior loss by its lambda_*_gt.
+                    loss_prior = lambda_albedo_gt * base_loss_albedo \
+                               + lambda_normal_gt * base_loss_normal \
+                               + lambda_metallic_gt * base_loss_metallic
 
-                        loss_prior = (base_loss_albedo * torch.exp(-w_a) + w_a) \
-                                   + (base_loss_metallic * torch.exp(-w_m) + w_m) \
-                                   + (base_loss_normal * torch.exp(-w_n) + w_n)
-                    else:
-                        # Fixed manual weighting: scale each prior loss by its lambda_*_gt.
-                        # The learnable uncertainty weights (_w_*) are NOT used here.
-                        loss_prior = lambda_albedo_gt * base_loss_albedo \
-                                   + lambda_normal_gt * base_loss_normal \
-                                   + lambda_metallic_gt * base_loss_metallic
+                    if gt_roughness_val is not None:
+                        base_loss_roughness = l1_loss(rendered_roughness, gt_roughness)
+                        loss_roughness_gt_val = base_loss_roughness.detach()
+                        loss_prior = loss_prior + lambda_roughness_gt * base_loss_roughness
 
-                    loss = loss + loss_prior
+                    loss = loss + loss_prior * multiplier
         loss.backward()
-
-        # When frozen, zero w_ gradients so they stay at w=0 (unit weighting)
-        if freeze_uncertainty_weights:
-            for w_param in (gaussians._w_albedo, gaussians._w_metallic, gaussians._w_normal):
-                if w_param.grad is not None:
-                    w_param.grad.zero_()
 
         iter_end.record()
 
@@ -621,20 +620,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     hdr_base = gaussians.envlight.base.detach()
                     print(f"\n[ITER {iteration}] EnvMap Stats — Min: {hdr_base.min().item():.4f}, Max: {hdr_base.max().item():.4f}, Mean: {hdr_base.mean().item():.4f}")
                 
-                print(f"[ITER {iteration}] Extended Loss — albedo_gt: {loss_albedo_gt_val.item():.4f}, normal_gt: {loss_normal_gt_val.item():.4f}, metallic_gt: {loss_metallic_gt_val.item():.4f}")
-                w_a, w_m, w_n = gaussians._w_albedo.item(), gaussians._w_metallic.item(), gaussians._w_normal.item()
-                print(f"[ITER {iteration}] Uncertainty w — albedo: {w_a:.4f} (eff: {torch.exp(-gaussians._w_albedo).item():.4f}), "
-                      f"metallic: {w_m:.4f} (eff: {torch.exp(-gaussians._w_metallic).item():.4f}), "
-                      f"normal: {w_n:.4f} (eff: {torch.exp(-gaussians._w_normal).item():.4f})")
-                
+                print(f"[ITER {iteration}] Extended Loss — albedo_gt: {loss_albedo_gt_val.item():.4f}, normal_gt: {loss_normal_gt_val.item():.4f}, metallic_gt: {loss_metallic_gt_val.item():.4f}, roughness_gt: {loss_roughness_gt_val.item():.4f}")
                 loss_entry = {
                     "iteration": iteration,
                     "albedo_gt": loss_albedo_gt_val.item(),
                     "normal_gt": loss_normal_gt_val.item(),
                     "metallic_gt": loss_metallic_gt_val.item(),
-                    "w_albedo": gaussians._w_albedo.item(),
-                    "w_metallic": gaussians._w_metallic.item(),
-                    "w_normal": gaussians._w_normal.item(),
+                    "roughness_gt": loss_roughness_gt_val.item(),
+                    "lambda_albedo": lambda_albedo_gt * multiplier,
+                    "lambda_normal": lambda_normal_gt * multiplier,
+                    "lambda_metallic": lambda_metallic_gt * multiplier,
+                    "lambda_roughness": lambda_roughness_gt * multiplier,
+                    "lambda_reg_hdr": reg_hdr_weight * multiplier,
                 }
                 loss_logs.append(loss_entry)
                 os.makedirs(os.path.dirname(loss_log_path), exist_ok=True)
@@ -794,12 +791,13 @@ if __name__ == "__main__":
     parser.add_argument("--reg_material_weight", type=float, default=0.1)
     parser.add_argument("--eval_interval", type=int, default=2000, help="Evaluate metrics every N iterations")
     parser.add_argument("--visual_interval", type=int, default=10000, help="Save visual comparisons every N iterations")
-    parser.add_argument("--lambda_albedo_gt", type=float, default=0.5, help="Weight for albedo GT loss")
+    parser.add_argument("--lambda_albedo_gt", type=float, default=0.1, help="Weight for albedo GT loss")
     parser.add_argument("--lambda_normal_gt", type=float, default=0.1, help="Weight for normal GT loss")
     parser.add_argument("--lambda_metallic_gt", type=float, default=0.05, help="Weight for metallic GT loss")
+    parser.add_argument("--lambda_roughness_gt", type=float, default=0.05, help="Weight for roughness GT loss")
+    parser.add_argument("--use_prior_weight_scheduler", action="store_true", default=True, help="Use scheduler for prior weights and envmap regularizer")
+    parser.add_argument("--prior_weight_scheduler_ratio", type=float, default=0.15, help="Warm-up ratio (fraction of remaining steps)")
     parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
-    parser.add_argument("--use_uncertainty_weights", action="store_true", default=False, help="Use learnable Kendall uncertainty weights for the prior losses. If not set, the fixed lambda_albedo_gt / lambda_normal_gt / lambda_metallic_gt weights are used instead")
-    parser.add_argument("--freeze_uncertainty_weights", action="store_true", default=False, help="Keep Kendall uncertainty weights frozen at w=0 (unit weighting) for A/B comparison")
     parser.add_argument("--eval_relight_hdris", nargs="+", type=str, default=['snowy_forest', 'moonless_night', 'fireplace'], help="List of HDRI names to evaluate relighting on")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -812,7 +810,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.exclude_prior_loss, args.use_uncertainty_weights, args.freeze_uncertainty_weights, args.eval_relight_hdris)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.exclude_prior_loss, args.eval_relight_hdris)
 
     # All done
     print("\nTraining complete.")

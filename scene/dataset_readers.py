@@ -38,6 +38,7 @@ class CameraInfo(NamedTuple):
     albedo_gt: object = None   # PIL Image or None
     normal_gt: object = None   # PIL Image or None
     metallic_gt: float = None  # scalar (e.g. 0.0) or None
+    roughness_gt: float = None # scalar (e.g. 0.5) or None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -180,7 +181,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, metallic_gt_value=None):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, metallic_gt_value=None, roughness_gt_value=None):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -237,6 +238,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             albedo_gt_img = None
             normal_gt_img = None
             metallic_gt = metallic_gt_value
+            roughness_gt = roughness_gt_value
 
             if gt_priors_dir is not None:
                 # Derive frame index from file_path, e.g. "./train/rgba/rgba_042" -> "042"
@@ -247,6 +249,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 albedo_gt_path = os.path.join(gt_priors_dir, "albedo_gt", f"albedo_{frame_idx_str}.png")
                 normal_gt_path = os.path.join(gt_priors_dir, "normal_gt", f"normal_{frame_idx_str}.png")
                 metallic_gt_path = os.path.join(gt_priors_dir, "metallic_gt", f"metallic_{frame_idx_str}.png")
+                roughness_gt_path = os.path.join(gt_priors_dir, "roughness_gt", f"roughness_{frame_idx_str}.png")
 
                 if os.path.exists(albedo_gt_path):
                     albedo_gt_img = Image.open(albedo_gt_path)
@@ -261,9 +264,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 if os.path.exists(metallic_gt_path):
                     metallic_gt = Image.open(metallic_gt_path)
 
+                if os.path.exists(roughness_gt_path):
+                    roughness_gt = Image.open(roughness_gt_path)
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], exposure=exposure,
-                            albedo_gt=albedo_gt_img, normal_gt=normal_gt_img, metallic_gt=metallic_gt))
+                            albedo_gt=albedo_gt_img, normal_gt=normal_gt_img, metallic_gt=metallic_gt, roughness_gt=roughness_gt))
             
     return cam_infos
 
@@ -342,13 +348,15 @@ def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png"):
     train_cam_infos = readCamerasFromTransforms(
         path, "transforms_train.json", white_background, extension,
         gt_priors_dir=train_gt_dir if has_train_gt else None,
-        metallic_gt_value=0.0 if has_train_gt else None)
+        metallic_gt_value=0.0 if has_train_gt else None,
+        roughness_gt_value=None)
 
     print("Reading Synthetic-with-Priors Test Transforms")
     test_cam_infos = readCamerasFromTransforms(
         path, "transforms_test.json", white_background, extension,
         gt_priors_dir=test_gt_dir if has_test_gt else None,
-        metallic_gt_value=0.0 if has_test_gt else None)
+        metallic_gt_value=0.0 if has_test_gt else None,
+        roughness_gt_value=None)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)

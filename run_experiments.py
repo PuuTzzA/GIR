@@ -10,13 +10,15 @@ PDF + CSV that overlays their:
     * Novel-view + relighting        -> relight_<hdri>_psnr / _ssim (test cams
                                         rendered under unseen HDRIs)
     * Prior loss curves              -> albedo_gt / normal_gt / metallic_gt
-    * (Learned) uncertainty weights  -> w_albedo / w_metallic / w_normal
+    * Novel-view performance        -> test_psnr / test_ssim / test_lpips
+    * Novel-view + relighting        -> relight_<hdri>_psnr / _ssim (test cams
+                                        rendered under unseen HDRIs)
+    * Prior loss curves              -> albedo_gt / normal_gt / metallic_gt
     * Training loss / #gaussians
 
-The three default runs for the `cube_colorful` quick test are:
+The two default runs for the `cube_colorful` quick test are:
     1. no_prior      : priors computed for logging only, NOT optimized
     2. fixed_lambda  : priors weighted by fixed lambda_albedo/normal/metallic_gt
-    3. uncertainty   : priors weighted by learnable Kendall uncertainty weights
 
 ------------------------------------------------------------------------------
 USAGE
@@ -28,7 +30,7 @@ USAGE
     python run_experiments.py --report-only
 
     # Run a subset by name:
-    python run_experiments.py --only no_prior uncertainty
+    python run_experiments.py --only no_prior fixed_lambda
 
 Edit the COMMON dict and the EXPERIMENTS list below to configure runs.
 """
@@ -78,9 +80,12 @@ COMMON = {
     "checkpoint_iterations": [7000],
 
     # Fixed-lambda weights (used by the fixed_lambda run).
-    "lambda_albedo_gt": 0.5,
+    "lambda_albedo_gt": 0.1,
     "lambda_normal_gt": 0.1,
     "lambda_metallic_gt": 0.05,
+    "lambda_roughness_gt": 0.05,
+    "use_prior_weight_scheduler": True,
+    "prior_weight_scheduler_ratio": 0.15,
 }
 
 # Where all run folders for this batch live.
@@ -97,12 +102,7 @@ EXPERIMENTS = [
     {
         "name": "fixed_lambda",
         "args": {},
-        "flags": {"use_uncertainty_weights": False},  # use fixed lambda_*_gt weights
-    },
-    {
-        "name": "uncertainty",
-        "args": {},
-        "flags": {"use_uncertainty_weights": True},   # learnable Kendall weights
+        "flags": {},  # use fixed lambda_*_gt weights
     },
 ]
 
@@ -125,8 +125,7 @@ def build_command(exp, model_path):
 
     # Boolean store_true flags handled separately (engine + run via train.py).
     bool_flags = {
-        "eval", "white_background", "exclude_prior_loss",
-        "use_uncertainty_weights", "freeze_uncertainty_weights",
+        "eval", "white_background", "exclude_prior_loss", "use_prior_weight_scheduler",
         "remove_noise", "hdr_rotation", "random_background", "quiet",
     }
 
@@ -388,16 +387,14 @@ def generate_comparison(runs, out_dir):
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
-        # ── Page 4: Prior losses + uncertainty weights ───────────────────
-        fig, axes = plt.subplots(2, 3, figsize=(11, 8.5))
-        fig.suptitle("Prior Losses & Uncertainty Weights",
+        # ── Page 4: Prior losses ───────────────────
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        fig.suptitle("Prior Losses",
                      fontsize=14, fontweight="bold")
         plot_loss(axes[0, 0], "albedo_gt", "Loss", "Albedo prior loss \u2193")
         plot_loss(axes[0, 1], "normal_gt", "Loss", "Normal prior loss \u2193")
-        plot_loss(axes[0, 2], "metallic_gt", "Loss", "Metallic prior loss \u2193")
-        plot_loss(axes[1, 0], "w_albedo", "w", "w_albedo (log-var)")
-        plot_loss(axes[1, 1], "w_metallic", "w", "w_metallic (log-var)")
-        plot_loss(axes[1, 2], "w_normal", "w", "w_normal (log-var)")
+        plot_loss(axes[1, 0], "metallic_gt", "Loss", "Metallic prior loss \u2193")
+        plot_loss(axes[1, 1], "roughness_gt", "Loss", "Roughness prior loss \u2193")
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
@@ -405,7 +402,7 @@ def generate_comparison(runs, out_dir):
     with open(csv_path, "w") as f:
         cols = ["run", "test_psnr", "test_ssim", "test_lpips",
                 "mean_relight_psnr", "mean_relight_ssim",
-                "albedo_gt", "normal_gt", "metallic_gt", "num_gaussians"]
+                "albedo_gt", "normal_gt", "metallic_gt", "roughness_gt", "num_gaussians"]
         f.write(",".join(cols) + "\n")
         for d in data:
             m = d["metrics"][-1] if d["metrics"] else {}
@@ -416,7 +413,7 @@ def generate_comparison(runs, out_dir):
                 d["name"],
                 m.get("test_psnr", ""), m.get("test_ssim", ""), m.get("test_lpips", ""),
                 rp[-1] if rp else "", rs[-1] if rs else "",
-                lc.get("albedo_gt", ""), lc.get("normal_gt", ""), lc.get("metallic_gt", ""),
+                lc.get("albedo_gt", ""), lc.get("normal_gt", ""), lc.get("metallic_gt", ""), lc.get("roughness_gt", ""),
                 m.get("num_gaussians", ""),
             ]
             f.write(",".join(str(x) for x in row) + "\n")
