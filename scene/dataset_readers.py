@@ -181,7 +181,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, metallic_gt_value=None, roughness_gt_value=None):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, albedo_dir="albedo_gt", normal_dir="normal_gt", metallic_dir="", roughness_dir=""):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -234,38 +234,34 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 FovY = fovx 
                 FovX = fovy
 
-            # --- Load GT priors if available ---
+            # --- Load GT priors from the configured per-property folders ---
+            # Each prior reads <gt_priors_dir>/<folder>/<prop>_<idx>.png; the file
+            # prefix is the property name (albedo/normal/metallic/roughness)
+            # regardless of which folder variant (e.g. *_gt, *_video) is chosen.
+            # A folder set to "" disables that prior (left as None).
             albedo_gt_img = None
             normal_gt_img = None
-            metallic_gt = metallic_gt_value
-            roughness_gt = roughness_gt_value
+            metallic_gt = None
+            roughness_gt = None
 
             if gt_priors_dir is not None:
                 # Derive frame index from file_path, e.g. "./train/rgba/rgba_042" -> "042"
                 basename = os.path.basename(frame["file_path"])  # "rgba_042"
                 frame_idx_str = basename.split("_")[-1]  # "042"
 
-                # Ground truth priors are only loaded from _gt directories
-                albedo_gt_path = os.path.join(gt_priors_dir, "albedo_gt", f"albedo_{frame_idx_str}.png")
-                normal_gt_path = os.path.join(gt_priors_dir, "normal_gt", f"normal_{frame_idx_str}.png")
-                metallic_gt_path = os.path.join(gt_priors_dir, "metallic_gt", f"metallic_{frame_idx_str}.png")
-                roughness_gt_path = os.path.join(gt_priors_dir, "roughness_gt", f"roughness_{frame_idx_str}.png")
+                def _load_prior(folder, prop):
+                    if not folder:
+                        return None
+                    prior_path = os.path.join(gt_priors_dir, folder, f"{prop}_{frame_idx_str}.png")
+                    if os.path.exists(prior_path):
+                        return Image.open(prior_path)
+                    print(f"[WARNING] {prop} prior not found: {prior_path}")
+                    return None
 
-                if os.path.exists(albedo_gt_path):
-                    albedo_gt_img = Image.open(albedo_gt_path)
-                else:
-                    print(f"[WARNING] Albedo GT not found: {albedo_gt_path}")
-
-                if os.path.exists(normal_gt_path):
-                    normal_gt_img = Image.open(normal_gt_path)
-                else:
-                    print(f"[WARNING] Normal GT not found: {normal_gt_path}")
-
-                if os.path.exists(metallic_gt_path):
-                    metallic_gt = Image.open(metallic_gt_path)
-
-                if os.path.exists(roughness_gt_path):
-                    roughness_gt = Image.open(roughness_gt_path)
+                albedo_gt_img = _load_prior(albedo_dir, "albedo")
+                normal_gt_img = _load_prior(normal_dir, "normal")
+                metallic_gt = _load_prior(metallic_dir, "metallic")
+                roughness_gt = _load_prior(roughness_dir, "roughness")
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], exposure=exposure,
@@ -320,43 +316,48 @@ def isSyntheticWithPriors(path):
     has_rgba_subdir = os.path.isdir(os.path.join(path, "train", "rgba"))
     return has_transforms and has_rgba_subdir
 
-def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png"):
+def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png",
+                                albedo_dir="albedo_gt", normal_dir="normal_gt",
+                                metallic_dir="", roughness_dir=""):
     """Read a synthetic dataset from the datasets_with_priors directory.
 
     These datasets (e.g. armadillo, lego) use the Blender/synthetic camera
     convention with transforms_*.json files, and store images under
-    {train,val,test}/rgba/.  GT priors (albedo_gt, normal_gt) are loaded
-    when available; metallic GT is fixed at 0.0.
+    {train,val,test}/rgba/.  Each GT prior (albedo/normal/metallic/roughness)
+    is read from a configurable per-property folder (e.g. albedo_gt,
+    albedo_video, albedo); a folder set to "" disables that prior.
     """
-    # Detect GT priors availability per split
     train_gt_dir = os.path.join(path, "train")
     test_gt_dir = os.path.join(path, "test")
 
-    has_train_gt = (os.path.isdir(os.path.join(train_gt_dir, "albedo_gt")) and
-                    os.path.isdir(os.path.join(train_gt_dir, "normal_gt")))
+    configured_dirs = [d for d in (albedo_dir, normal_dir, metallic_dir, roughness_dir) if d]
 
-    has_test_gt = (os.path.isdir(os.path.join(test_gt_dir, "albedo_gt")) and
-                   os.path.isdir(os.path.join(test_gt_dir, "normal_gt")))
+    def _found_dirs(split_dir):
+        return [d for d in configured_dirs if os.path.isdir(os.path.join(split_dir, d))]
+
+    train_found = _found_dirs(train_gt_dir)
+    test_found = _found_dirs(test_gt_dir)
+    has_train_gt = len(train_found) > 0
+    has_test_gt = len(test_found) > 0
 
     if has_train_gt:
-        print("Found GT priors (albedo_gt, normal_gt) in train split")
-
+        print(f"Found GT prior folders in train split: {train_found}")
     if has_test_gt:
-        print("Found GT priors (albedo_gt, normal_gt) in test split")
+        print(f"Found GT prior folders in test split: {test_found}")
 
     print("Reading Synthetic-with-Priors Training Transforms")
     train_cam_infos = readCamerasFromTransforms(
         path, "transforms_train.json", white_background, extension,
         gt_priors_dir=train_gt_dir if has_train_gt else None,
-        metallic_gt_value=0.0 if has_train_gt else None,
-        roughness_gt_value=None)
+        albedo_dir=albedo_dir, normal_dir=normal_dir,
+        metallic_dir=metallic_dir, roughness_dir=roughness_dir)
 
     print("Reading Synthetic-with-Priors Test Transforms")
     test_cam_infos = readCamerasFromTransforms(
         path, "transforms_test.json", white_background, extension,
         gt_priors_dir=test_gt_dir if has_test_gt else None,
-        metallic_gt_value=0.0 if has_test_gt else None,
-        roughness_gt_value=None)
+        albedo_dir=albedo_dir, normal_dir=normal_dir,
+        metallic_dir=metallic_dir, roughness_dir=roughness_dir)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)

@@ -45,7 +45,12 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif isSyntheticWithPriors(args.source_path):
             print("Found transforms_train.json + train/rgba/, assuming synthetic-with-priors data set!")
-            scene_info = sceneLoadTypeCallbacks["SyntheticWithPriors"](args.source_path, args.white_background, args.eval)
+            scene_info = sceneLoadTypeCallbacks["SyntheticWithPriors"](
+                args.source_path, args.white_background, args.eval,
+                albedo_dir=getattr(args, "albedo_gt_dir", "albedo_gt"),
+                normal_dir=getattr(args, "normal_gt_dir", "normal_gt"),
+                metallic_dir=getattr(args, "metallic_gt_dir", ""),
+                roughness_dir=getattr(args, "roughness_gt_dir", ""))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)

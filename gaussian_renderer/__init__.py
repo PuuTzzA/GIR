@@ -175,19 +175,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     elif iteration > first_stage_step:
+        # Phase 2 (normal alignment): the geometry-derived shading normal must be
+        # differentiable EVERY iteration so the GT-normal prior can supervise the
+        # gaussian rotation / scaling here. Albedo & material are not optimized
+        # yet in this phase, so they are rendered only periodically (no_grad) for
+        # visualization / logging.
+        render_normal = (pc.get_eigenvector + 1) / 2
+        rendered_normal, _, _, _ = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = render_normal,
+            opacities = opacity,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
         if iteration % 500 == 0:
             with torch.no_grad():
-                render_normal = (pc.get_eigenvector + 1) / 2
                 render_material = torch.cat([pc.get_metallic_init, pc.get_roughness_init.clamp(0.08, 0.5), torch.zeros((render_normal.shape[0],1), device="cuda")], -1)
-                rendered_normal, _, _, _ = rasterizer(
-                    means3D = means3D,
-                    means2D = means2D,
-                    shs = shs,
-                    colors_precomp = render_normal,
-                    opacities = opacity,
-                    scales = scales,
-                    rotations = rotations,
-                    cov3D_precomp = cov3D_precomp)
                 rendered_material, _, _, _ = rasterizer(
                     means3D = means3D,
                     means2D = means2D,

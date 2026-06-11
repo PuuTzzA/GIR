@@ -93,5 +93,84 @@ def tv_loss(image):
     h_tv = torch.abs(image[ :, :-1, :] - image[:, 1:, :])
     w_tv = torch.abs(image[:, :, :-1] - image[:, :, 1:])
     return h_tv.mean() + w_tv.mean()
-    
+
+
+# =============================================================================
+# Robust (Huber) losses and ground-truth albedo prior losses
+# =============================================================================
+
+def huber_elementwise(pred, gt, delta=0.1):
+    """Element-wise Huber / smooth-L1 (beta = delta).
+
+    Quadratic for |pred-gt| < delta, linear beyond. Normalised so the linear
+    region has slope 1, i.e. it matches the magnitude of an L1 loss for large
+    residuals (drop-in replacement for l1_loss that is less sensitive to
+    outliers near zero).
+    """
+    diff = pred - gt
+    absd = torch.abs(diff)
+    return torch.where(absd < delta, 0.5 * diff * diff / delta, absd - 0.5 * delta)
+
+
+def huber_loss(pred, gt, delta=0.1, mask=None):
+    """Mean Huber loss, optionally restricted to a (broadcastable) mask."""
+    h = huber_elementwise(pred, gt, delta)
+    if mask is None:
+        return h.mean()
+    m = mask.expand_as(h)
+    return (h * m).sum() / m.sum().clamp_min(1.0)
+
+
+def _foreground_mask(gt, eps=1e-6):
+    """1xHxW mask of pixels where the GT buffer is non-zero (object, not bg)."""
+    return (gt.sum(dim=0, keepdim=True) > eps).to(gt.dtype)
+
+
+def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
+    """GT-supervised albedo loss with selectable invariance to the
+    albedo<->light intensity/colour ambiguity.
+
+    Modes:
+      * "direct"     : Huber + DSSIM on raw values (pins absolute albedo).
+      * "lstsq"      : per-channel least-squares gain aligns the rendered albedo
+                       to GT before comparing, so only spatial structure and
+                       relative colour are supervised (the global per-channel
+                       scale is free, absorbing the envmap intensity ambiguity).
+      * "log_chroma" : supervises chromaticity (intensity-invariant colour) plus
+                       a scale-invariant log-intensity term (per-channel mean
+                       shift removed), the intrinsic-image style decomposition.
+    """
+    if mode == "lstsq":
+        mask = _foreground_mask(gt)
+        # Closed-form per-channel gain s_c = <r,g> / <r,r> over foreground.
+        num = (rendered * gt * mask).sum(dim=(1, 2))
+        den = (rendered * rendered * mask).sum(dim=(1, 2)).clamp_min(1e-8)
+        s = (num / den).detach().clamp_min(0.0).view(-1, 1, 1)
+        aligned = rendered * s
+        data = huber_loss(aligned, gt, delta)
+        struct = 1.0 - ssim(aligned, gt)
+        return (1.0 - lambda_dssim) * data + lambda_dssim * struct
+
+    if mode == "log_chroma":
+        eps = 1e-3
+        mask = _foreground_mask(gt)
+        # Chromaticity: intensity-invariant colour (per-pixel channel ratios).
+        chroma_r = rendered / (rendered.sum(dim=0, keepdim=True) + eps)
+        chroma_g = gt / (gt.sum(dim=0, keepdim=True) + eps)
+        loss_chroma = huber_loss(chroma_r, chroma_g, delta, mask=mask)
+        # Scale-invariant log intensity: remove per-channel mean of the log
+        # difference (a global multiplicative gain becomes an additive shift).
+        log_diff = (torch.log(rendered.clamp_min(0.0) + eps)
+                    - torch.log(gt.clamp_min(0.0) + eps))
+        n = mask.sum().clamp_min(1.0)
+        mean_shift = (log_diff * mask).sum(dim=(1, 2), keepdim=True) / n
+        centered = (log_diff - mean_shift)
+        loss_log = huber_loss(centered, torch.zeros_like(centered), delta, mask=mask)
+        return loss_chroma + loss_log
+
+    # Default: "direct"
+    data = huber_loss(rendered, gt, delta)
+    struct = 1.0 - ssim(rendered, gt)
+    return (1.0 - lambda_dssim) * data + lambda_dssim * struct
+
     

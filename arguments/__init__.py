@@ -54,6 +54,14 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        # Per-property GT-prior folders for synthetic-with-priors datasets.
+        # Choose which sub-folder under each split to read each prior from,
+        # e.g. for albedo: "albedo_gt" | "albedo_video" | "albedo". Set to ""
+        # to DISABLE that prior entirely (its loss weight is forced to 0).
+        self.albedo_gt_dir = "albedo_gt"
+        self.normal_gt_dir = "normal_gt"
+        self.metallic_gt_dir = ""
+        self.roughness_gt_dir = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

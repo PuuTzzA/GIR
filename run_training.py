@@ -53,6 +53,14 @@ CONFIG = {
     "data_device": "cuda",          # default: cuda   | device the dataset tensors live on
     "eval": False,                   # default: False  | hold out test cameras for evaluation
 
+    # Per-property GT-prior folders (synthetic-with-priors datasets). Choose the
+    # sub-folder under each split, e.g. albedo: albedo_gt | albedo_video | albedo.
+    # Set to "" to DISABLE that prior (its loss weight is forced to 0).
+    "albedo_gt_dir": "albedo_gt",   # default: albedo_gt
+    "normal_gt_dir": "normal_gt",   # default: normal_gt
+    "metallic_gt_dir": "",          # default: ""  (e.g. lego has no metallic_gt)
+    "roughness_gt_dir": "",         # default: ""  (e.g. lego has no roughness_gt)
+
     # ----------------------------------------------------------------------
     # PipelineParams - rasterizer / rendering pipeline
     # ----------------------------------------------------------------------
@@ -121,6 +129,9 @@ CONFIG = {
     "hdr_rotation": False,           # default: False  | optimize HDR rotation
     "reg_hdr_weight": 0.001,         # default: 0.001  | HDR smoothness regularization weight
     "reg_material_weight": 0.1,      # default: 0.1    | material smoothness regularization weight
+    "tv_reduction_factor": 1.0,      # default: 1.0    | scale (0..1) for a property's TV/smoothness
+                                     #                  | regularizer when that property has a GT prior
+                                     #                  | (0 = off, 1 = unchanged). Only affects priored props.
 
     # ----------------------------------------------------------------------
     # Priors - GT prior supervision ADDED to the engine
@@ -189,6 +200,7 @@ def build_args():
     parser.add_argument("--hdr_rotation", action="store_true", default=None)
     parser.add_argument("--reg_hdr_weight", type=float)
     parser.add_argument("--reg_material_weight", type=float)
+    parser.add_argument("--tv_reduction_factor", type=float)
     parser.add_argument("--eval_interval", type=int)
     parser.add_argument("--visual_interval", type=int)
     parser.add_argument("--lambda_albedo_gt", type=float)
@@ -252,18 +264,19 @@ def main():
         args.second_stage_step,
         args.remove_noise,
         args.hdr_rotation,
-        args.reg_hdr_weight,
-        args.reg_material_weight,
-        args.eval_interval,
-        args.visual_interval,
-        args.lambda_albedo_gt,
-        args.lambda_normal_gt,
-        args.lambda_metallic_gt,
-        args.lambda_roughness_gt,
-        args.use_prior_weight_scheduler,
-        args.prior_weight_scheduler_ratio,
-        args.exclude_prior_loss,
-        args.eval_relight_hdris,
+        reg_hdr_weight=args.reg_hdr_weight,
+        reg_material_weight=args.reg_material_weight,
+        eval_interval=args.eval_interval,
+        visual_interval=args.visual_interval,
+        lambda_albedo_gt=args.lambda_albedo_gt,
+        lambda_normal_gt=args.lambda_normal_gt,
+        lambda_metallic_gt=args.lambda_metallic_gt,
+        lambda_roughness_gt=args.lambda_roughness_gt,
+        use_prior_weight_scheduler=args.use_prior_weight_scheduler,
+        prior_weight_scheduler_ratio=args.prior_weight_scheduler_ratio,
+        exclude_prior_loss=args.exclude_prior_loss,
+        eval_relight_hdris=args.eval_relight_hdris,
+        tv_reduction_factor=args.tv_reduction_factor,
     )
 
     print("\nTraining complete.")

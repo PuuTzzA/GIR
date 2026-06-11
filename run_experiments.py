@@ -16,9 +16,52 @@ PDF + CSV that overlays their:
     * Prior loss curves              -> albedo_gt / normal_gt / metallic_gt
     * Training loss / #gaussians
 
-The two default runs for the `cube_colorful` quick test are:
-    1. no_prior      : priors computed for logging only, NOT optimized
-    2. fixed_lambda  : priors weighted by fixed lambda_albedo/normal/metallic_gt
+------------------------------------------------------------------------------
+THREE-PHASE TRAINING PIPELINE
+------------------------------------------------------------------------------
+The GIR engine is driven by two stage boundaries, `first_stage_step` and
+`second_stage_step`, which this batch uses to realise an explicit 3-phase
+schedule (priors are introduced gradually, geometry first):
+
+  * Phase 1 — GEOMETRY  (iter <= first_stage_step)
+        GIR's radiance warm-up. Gaussian positions / scales / rotations /
+        opacity and a plain view-dependent colour are optimised against the RGB
+        images so densification places gaussians where the geometry is. No PBR
+        decomposition, no GT priors, no material TV losses yet.
+
+  * Phase 2 — NORMAL ALIGNMENT  (first_stage_step < iter <= second_stage_step)
+        The geometry-derived shading normal becomes differentiable every
+        iteration and is supervised by the GT normal prior (this back-props into
+        gaussian rotation / scaling, locking in surface orientation before any
+        material is decomposed). Albedo / metallic / roughness priors stay OFF.
+        Only a (reduced) edge-aware normal smoothness is applied.
+
+  * Phase 3 — FULL PBR  (iter > second_stage_step)
+        The full GIR PBR decomposition runs. All available GT priors are applied
+        (albedo via the selected mode, plus normal / metallic / roughness) under
+        the up-then-down weight scheduler, together with the TV / smoothness
+        regularizers — each TV term scaled by `tv_reduction_factor` for any
+        property that has a GT prior (the GT already constrains it, so artificial
+        smoothness is unnecessary / harmful).
+
+------------------------------------------------------------------------------
+THE SIX RUNS (lego, resolution 8)
+------------------------------------------------------------------------------
+    1. baseline_no_prior     : GIR baseline. Priors computed for logging only
+                               (NOT optimized), full TV losses, envmap
+                               regularizer ON, no prior scheduler.
+    2. tv_off_direct         : priors ON, "direct" albedo loss, TV losses for
+                               priored properties fully removed (factor 0.0).
+    3. tv_off_log_chroma     : as (2) but the log-intensity + chromaticity
+                               (intrinsic-image) albedo loss.
+    4. tv_low_direct         : priors ON, "direct" albedo loss, TV losses for
+                               priored properties almost removed (factor 0.05).
+    5. tv_low_log_chroma     : as (4) but the log_chroma albedo loss.
+    6. tv_low_direct_lambdas : as (4) but different GT-prior loss weights
+                               (lambda_*_gt) to probe their sensitivity.
+
+   The per-channel least-squares albedo mode ("lstsq") is kept in the engine but
+   dropped from this batch (log_chroma consistently beats it).
 
 ------------------------------------------------------------------------------
 USAGE
@@ -53,59 +96,145 @@ REPO_DIR = os.path.dirname(GIR_DIR)
 # CONFIGURATION  -- edit here to add / change runs
 # =============================================================================
 
-# Parameters shared by every run in this experiment batch.
-# These are deliberately "quick test" values: few iterations and an EARLY start
-# of the PBR (second) stage so the prior losses kick in soon.
+# Parameters shared by every run in this experiment batch. Tuned for an
+# extensive-but-affordable lego comparison at resolution 8 with 12k iterations.
+# The stage boundaries realise the 3-phase pipeline described in the module
+# docstring; densification / opacity-reset are arranged to FINISH well before
+# the end so nothing disturbs the final gaussians.
+LEGO_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "lego")
 COMMON = {
-    "source_path": os.path.join(REPO_DIR, "data", "datasets_with_priors", "cube_colorful"),
+    "source_path": LEGO_DIR,
     "eval": True,                 # hold out the test cameras for novel-view eval
-    "white_background": False,    # cube_colorful is a Blender-synthetic scene
-    "densify_grad_threshold": 0.0004,# default: 0.0002
+    "white_background": False,    # lego is a Blender-synthetic scene
     "resolution": 2,               # default: -1     | -1 = keep native resolution
-    "max_gaussians": 300000,       # default: 0      | hard cap on #gaussians (0 = unlimited)
 
-    "iterations": 30000,           # total iterations (default engine: 60_000)
-    "first_stage_step": 2000,     # end of radiance warm-up (default: 5_000)
-    "second_stage_step": 4000,    # START of PBR decomposition EARLY (default: 30_000)
+    "iterations": 60_000,          # total iterations (passable quality, not too slow)
 
-    "eval_interval": 191,         # evaluate metrics every N iters
-    "visual_interval": 3500,      # save visual comparisons every N iters
+    # ── 3-phase schedule ────────────────────────────────────────────────
+    #   Phase 1 GEOMETRY        : iter 0    .. 2000   (radiance warm-up)
+    #   Phase 2 NORMAL ALIGN    : iter 2000 .. 5000   (GT normal prior only)
+    #   Phase 3 FULL PBR        : iter 5000 .. 12000  (all priors + materials)
+    "first_stage_step": 5_000,      # end of Phase 1 (radiance warm-up)
+    "second_stage_step": 30_000,     # end of Phase 2 / start of Phase 3 (PBR)
 
-    # HDRIs available for cube_colorful (rgba_<name> folders + hdris/<name>.hdr)
-    "eval_relight_hdris": ["snowy_forest", "moonless_night", "gym_entrance"],
+    # Densification / pruning. densify_until_iter (7000) < iterations (12000),
+    # and opacity_reset_interval (3000) only fires at 3000 & 6000 (both inside
+    # the densify window), so the last 5000 iters settle cleanly with no
+    # densification / opacity reset disturbing the final result.
+    "percent_dense": 0.01,           # default: 0.01
+    "lambda_dssim": 0.4,             # default: 0.4    | weight of the D-SSIM term in RGB loss
+    "densification_interval": 100,   # default: 100
+    "opacity_reset_interval": 3000,  # resets only at 3000 & 6000 (< densify_until_iter)
+    "densify_from_iter": 500,        # default: 500
+    "densify_until_iter": 45_000,    # default: 45_000
+    "densify_grad_threshold": 0.0002,# default: 0.0002
+    "max_gaussians": 300_000,        # hard cap on #gaussians (0 = unlimited)
+    "random_background": False,      # default: False
 
-    # Keep disk usage small for the quick test: only save/checkpoint at the end.
-    "save_iterations": [7000],
-    "test_iterations": [7000],
-    "checkpoint_iterations": [7000],
+    "eval_interval": 2_000,          # evaluate metrics every N iters
+    "visual_interval": 5_000,        # save visual comparisons every N iters
 
-    # Fixed-lambda weights (used by the fixed_lambda run).
-    "lambda_albedo_gt": 0.1,
-    "lambda_normal_gt": 0.1,
+    # HDRIs available for lego (rgba_<name> folders + hdris/<name>.hdr).
+    "eval_relight_hdris": ["fireplace", "night", "snow"], # HDRIs for blender datasets (lego, armadillo)
+    # "eval_relight_hdris": ["gym_entrance", "moonless_night", "snowy_forest"], # HDRIs for our own synthetic datasets (cube, cube_colorful, sphere, sphere_colorful)
+
+    # Keep disk usage small: only save/checkpoint at the very end.
+    "save_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000], #[12_000],
+    "test_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000],
+    "checkpoint_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000],
+
+    # Which sub-folder under each split to read each GT prior from. Pick any
+    # available variant per property, e.g. for albedo: "albedo_gt" | "albedo_video"
+    # | "albedo". Set to "" to DISABLE that prior entirely (its loss weight below
+    # is forced to 0). lego has no metallic_gt/roughness_gt folders, so those are
+    # left "" here -- the OLD code silently supervised metallic toward a constant
+    # 0.0 and skipped roughness. Switch to "metallic"/"metallic_video" (estimated,
+    # not GT) if you want to supervise them.
+    "albedo_gt_dir": "albedo_gt",
+    "normal_gt_dir": "normal_gt",
+    "metallic_gt_dir": "",
+    "roughness_gt_dir": "",
+
+    # Prior loss weights (used by every run that optimizes the priors).
+    # A weight is auto-forced to 0 when its *_gt_dir above is "".
+    "lambda_albedo_gt": 0.25,
+    "lambda_normal_gt": 0.8,
     "lambda_metallic_gt": 0.05,
     "lambda_roughness_gt": 0.05,
-    "use_prior_weight_scheduler": True,
+
+    # Up-then-down prior schedule (Phase 3 only): warm up over the first 15% of
+    # the PBR stage, then cosine-decay back down to 50% of the max weight.
     "prior_weight_scheduler_ratio": 0.15,
+    "prior_weight_floor_ratio": 0.5,
+
+    # Robust Huber delta for the prior losses.
+    "huber_delta": 0.2,
+
+    # Default albedo prior formulation; overridden per experiment below.
+    "albedo_prior_mode": "direct",
+
+    # TV / smoothness reduction for properties that have a GT prior. 1.0 keeps
+    # the regularizer at full strength (baseline); per-experiment overrides lower
+    # or remove it. Properties WITHOUT a GT prior always keep full TV.
+    "tv_reduction_factor": 1.0,
+
+    # Envmap-neutrality regularizer. Kept small for prior runs (GT albedo helps
+    # resolve the albedo/light-colour ambiguity); baseline raises it slightly.
+    "reg_hdr_weight": 0.0001,
+
+    # GT base-light HDRI for the environment-map recovery metric (lego = sunset).
+    "envmap_gt_path": os.path.join(LEGO_DIR, "hdris", "sunset.hdr"),
 }
 
 # Where all run folders for this batch live.
-EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "experiments_cube_colorful")
+EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "experiment_tv_low_direct_60k")
 
 # Each experiment = a display name + a dict of args that OVERRIDE / EXTEND COMMON.
 # `flags` are boolean store_true switches passed only when True.
 EXPERIMENTS = [
     {
-        "name": "no_prior",
-        "args": {},
-        "flags": {"exclude_prior_loss": True},   # compute priors but don't optimize them
+        # GIR baseline: priors for logging only, full TV losses, envmap
+        # regularizer at its paper value, no prior scheduler.
+        "name": "baseline_no_prior",
+        "args": {"reg_hdr_weight": 0.001, "tv_reduction_factor": 1.0},
+        "flags": {"exclude_prior_loss": True},
     },
+    #{
+    #    # Priors ON, direct albedo loss, TV losses for priored props REMOVED.
+    #    "name": "tv_off_direct",
+    #    "args": {"albedo_prior_mode": "direct", "tv_reduction_factor": 0.0},
+    #    "flags": {"use_prior_weight_scheduler": True},
+    #},
+    #{
+    #    # Priors ON, log_chroma albedo loss, TV losses for priored props REMOVED.
+    #    "name": "tv_off_log_chroma",
+    #    "args": {"albedo_prior_mode": "log_chroma", "tv_reduction_factor": 0.0},
+    #    "flags": {"use_prior_weight_scheduler": True},
+    #},
     {
-        "name": "fixed_lambda",
-        "args": {},
-        "flags": {},  # use fixed lambda_*_gt weights
+        # Priors ON, direct albedo loss, TV losses ALMOST removed (5%).
+        "name": "tv_low_direct",
+        "args": {"albedo_prior_mode": "direct", "tv_reduction_factor": 0.05},
+        "flags": {"use_prior_weight_scheduler": True},
     },
+    #{
+    #    # Priors ON, log_chroma albedo loss, TV losses ALMOST removed (5%).
+    #    "name": "tv_low_log_chroma",
+    #    "args": {"albedo_prior_mode": "log_chroma", "tv_reduction_factor": 0.05},
+    #    "flags": {"use_prior_weight_scheduler": True},
+    #},
+    #{
+    #    # As tv_low_direct but different GT-prior loss weights (sensitivity probe).
+    #    "name": "tv_low_direct_lambdas",
+    #    "args": {
+    #        "albedo_prior_mode": "direct",
+    #        "tv_reduction_factor": 0.05,
+    #        "lambda_albedo_gt": 0.4,
+    #        "lambda_normal_gt": 0.5,
+    #    },
+    #    "flags": {"use_prior_weight_scheduler": True},
+    #},
 ]
-
 
 # =============================================================================
 # RUN LAUNCHING
@@ -383,7 +512,9 @@ def generate_comparison(runs, out_dir):
         else:
             ax_bar.text(0.5, 0.5, "No relight data", ha="center", va="center",
                         transform=ax_bar.transAxes)
-        axes[1, 1].axis("off")
+        # Scale-aligned relight PSNR (single gain fit -> decomposition quality).
+        plot_avg_relight(axes[1, 1], "_psnr_aligned", "PSNR (dB)",
+                         "Mean Relight PSNR, scale-aligned \u2191")
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
@@ -398,21 +529,38 @@ def generate_comparison(runs, out_dir):
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
+        # ── Page 5: Decomposition quality + environment-map recovery ──────
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        fig.suptitle("Decomposition Quality & Envmap Recovery",
+                     fontsize=14, fontweight="bold")
+        plot_metric(axes[0, 0], "test_albedo_psnr", "PSNR (dB)", "Albedo PSNR \u2191")
+        plot_metric(axes[0, 1], "test_normal_ang_err", "Degrees", "Normal angular error \u2193")
+        plot_metric(axes[1, 0], "test_metallic_mae", "MAE", "Metallic MAE \u2193")
+        plot_metric(axes[1, 1], "envmap_log_psnr", "log-PSNR (dB)", "EnvMap recovery \u2191")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
     # ── CSV summary of final metrics ─────────────────────────────────────
     with open(csv_path, "w") as f:
-        cols = ["run", "test_psnr", "test_ssim", "test_lpips",
-                "mean_relight_psnr", "mean_relight_ssim",
+        cols = ["run", "test_psnr", "test_psnr_aligned", "test_ssim", "test_lpips",
+                "mean_relight_psnr", "mean_relight_psnr_aligned", "mean_relight_ssim",
+                "test_albedo_psnr", "test_normal_ang_err", "test_metallic_mae", "test_roughness_mae",
+                "envmap_log_psnr", "envmap_rel_l1",
                 "albedo_gt", "normal_gt", "metallic_gt", "roughness_gt", "num_gaussians"]
         f.write(",".join(cols) + "\n")
         for d in data:
             m = d["metrics"][-1] if d["metrics"] else {}
             lc = d["loss"][-1] if d["loss"] else {}
             _, rp = _avg_relight_series(d["metrics"], "_psnr")
+            _, rpa = _avg_relight_series(d["metrics"], "_psnr_aligned")
             _, rs = _avg_relight_series(d["metrics"], "_ssim")
             row = [
                 d["name"],
-                m.get("test_psnr", ""), m.get("test_ssim", ""), m.get("test_lpips", ""),
-                rp[-1] if rp else "", rs[-1] if rs else "",
+                m.get("test_psnr", ""), m.get("test_psnr_aligned", ""), m.get("test_ssim", ""), m.get("test_lpips", ""),
+                rp[-1] if rp else "", rpa[-1] if rpa else "", rs[-1] if rs else "",
+                m.get("test_albedo_psnr", ""), m.get("test_normal_ang_err", ""),
+                m.get("test_metallic_mae", ""), m.get("test_roughness_mae", ""),
+                m.get("envmap_log_psnr", ""), m.get("envmap_rel_l1", ""),
                 lc.get("albedo_gt", ""), lc.get("normal_gt", ""), lc.get("metallic_gt", ""), lc.get("roughness_gt", ""),
                 m.get("num_gaussians", ""),
             ]
