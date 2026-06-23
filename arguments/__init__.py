@@ -62,6 +62,14 @@ class ModelParams(ParamGroup):
         self.normal_gt_dir = "normal_gt"
         self.metallic_gt_dir = ""
         self.roughness_gt_dir = ""
+        # Axis convention of the (real-world) camera-space normal priors. GIR
+        # renders WORLD-space normals, so camera-space priors are rotated into
+        # world space using each camera pose; this sets how the prior's view
+        # axes map to the COLMAP camera axes before that rotation:
+        #   "opengl"          : X right, Y up, Z toward viewer (flip Y,Z).
+        #   "opencv"/"colmap" : X right, Y down, Z forward (no flip).
+        # Only used for ColmapWithPriors datasets (normals in camera space).
+        self.normal_camera_convention = "opengl"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

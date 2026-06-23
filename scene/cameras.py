@@ -18,7 +18,8 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", exposure=0.0,
-                 albedo_gt=None, normal_gt=None, metallic_gt=None, roughness_gt=None, image_path=None
+                 albedo_gt=None, normal_gt=None, metallic_gt=None, roughness_gt=None, image_path=None,
+                 normal_in_camera_space=False, normal_camera_convention="opengl"
                  ):
         super(Camera, self).__init__()
 
@@ -69,6 +70,17 @@ class Camera(nn.Module):
         else:
             self.roughness_gt = roughness_gt
         self.image_path = image_path
+
+        # Camera-space normal handling. GIR renders WORLD-space normals, so a
+        # GT normal prior stored in camera/view space (real-world COLMAP priors)
+        # must be rotated into world space before the cosine loss. `R` is the
+        # camera-to-world rotation (R = R_world2cam^T), so n_world = R @ n_cam.
+        self.normal_in_camera_space = normal_in_camera_space
+        self.normal_camera_convention = normal_camera_convention
+        if normal_in_camera_space:
+            self.R_cam2world = torch.tensor(np.asarray(R), dtype=torch.float32, device=self.data_device)
+        else:
+            self.R_cam2world = None
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

@@ -39,6 +39,7 @@ class CameraInfo(NamedTuple):
     normal_gt: object = None   # PIL Image or None
     metallic_gt: float = None  # scalar (e.g. 0.0) or None
     roughness_gt: float = None # scalar (e.g. 0.5) or None
+    normal_in_camera_space: bool = False  # True for real-world (COLMAP) priors
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -389,8 +390,169 @@ def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png",
                            ply_path=ply_path)
     return scene_info
 
+def isColmapWithPriors(path):
+    """Detect a real-world COLMAP dataset that ships diffusion priors.
+
+    These datasets (e.g. bicycle, garden) have all frames directly under a
+    rgba/ folder (no train/val/test split), a COLMAP `sparse/` reconstruction
+    for the camera poses, and per-property prior folders (albedo/, normal/, ...)
+    at the dataset root.  They are distinguished from the synthetic-with-priors
+    datasets by the ABSENCE of transforms_train.json.
+    """
+    has_sparse = os.path.isdir(os.path.join(path, "sparse"))
+    has_rgba = os.path.isdir(os.path.join(path, "rgba"))
+    has_transforms = os.path.exists(os.path.join(path, "transforms_train.json"))
+    return has_sparse and has_rgba and not has_transforms
+
+
+def _colmap_rgba_lookup(rgba_dir):
+    """Map a sequential frame index -> rgba file path.
+
+    The prior-extraction pipeline renames the COLMAP images to
+    <dataset>_<idx:03d>.<ext> in sorted-name order, so the i-th camera (after
+    sorting the COLMAP extrinsics by name) corresponds to <prefix>_<i:03d>.
+    Returns (prefix, ext, {idx: filepath}).
+    """
+    files = sorted(os.listdir(rgba_dir))
+    mapping = {}
+    prefix, ext = None, None
+    for f in files:
+        stem, e = os.path.splitext(f)
+        if "_" not in stem:
+            continue
+        pfx, idx_str = stem.rsplit("_", 1)
+        if not idx_str.isdigit():
+            continue
+        idx = int(idx_str)
+        mapping[idx] = os.path.join(rgba_dir, f)
+        prefix, ext = pfx, e
+    return prefix, ext, mapping
+
+
+def readColmapWithPriorsInfo(path, eval, llffhold=8,
+                             albedo_dir="albedo", normal_dir="normal",
+                             metallic_dir="", roughness_dir=""):
+    """Read a real-world COLMAP dataset that ships diffusion priors.
+
+    Camera poses come from the COLMAP `sparse/0` reconstruction; RGB frames live
+    in rgba/ and the GT-style priors in per-property folders at the dataset root
+    (albedo/, normal/, ...). The i-th camera (COLMAP extrinsics sorted by name)
+    maps to rgba/<prefix>_<i:03d>.<ext> and <prop_dir>/<prop>_<i:03d>.png, which
+    matches the renaming done by the prior-extraction pipeline.
+
+    The normal priors are stored in CAMERA space (they come from a per-view
+    diffusion model), so each CameraInfo is flagged `normal_in_camera_space=True`
+    and the training code rotates them into world space using the camera pose.
+    """
+    try:
+        cam_extrinsics = read_extrinsics_binary(os.path.join(path, "sparse/0", "images.bin"))
+        cam_intrinsics = read_intrinsics_binary(os.path.join(path, "sparse/0", "cameras.bin"))
+    except Exception:
+        cam_extrinsics = read_extrinsics_text(os.path.join(path, "sparse/0", "images.txt"))
+        cam_intrinsics = read_intrinsics_text(os.path.join(path, "sparse/0", "cameras.txt"))
+
+    rgba_dir = os.path.join(path, "rgba")
+    prefix, ext, rgba_map = _colmap_rgba_lookup(rgba_dir)
+
+    # Sort the COLMAP cameras by name so the sequential index matches the
+    # <prefix>_<idx> renaming performed during prior extraction.
+    sorted_keys = sorted(cam_extrinsics, key=lambda k: cam_extrinsics[k].name)
+
+    def _load_prior(folder, prop, frame_idx):
+        if not folder:
+            return None
+        prior_path = os.path.join(path, folder, f"{prop}_{frame_idx:03d}.png")
+        if os.path.exists(prior_path):
+            return Image.open(prior_path)
+        print(f"[WARNING] {prop} prior not found: {prior_path}")
+        return None
+
+    configured = [d for d in (albedo_dir, normal_dir, metallic_dir, roughness_dir) if d]
+    found = [d for d in configured if os.path.isdir(os.path.join(path, d))]
+    if found:
+        print(f"Found COLMAP prior folders: {found}")
+
+    cam_infos = []
+    for idx, key in enumerate(sorted_keys):
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+
+        R = np.transpose(qvec2rotmat(extr.qvec))  # camera-to-world rotation
+        T = np.array(extr.tvec)
+
+        if intr.model == "SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        elif intr.model == "PINHOLE":
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+
+        image_path = rgba_map.get(idx)
+        if image_path is None or not os.path.exists(image_path):
+            print(f"[WARNING] rgba frame not found for index {idx} "
+                  f"(expected {prefix}_{idx:03d}{ext}); skipping camera.")
+            continue
+        image_name = Path(image_path).stem
+        # Real photos have no alpha; force RGBA so the (all-opaque) mask exists.
+        image = Image.open(image_path).convert("RGBA")
+
+        albedo_gt_img = _load_prior(albedo_dir, "albedo", idx)
+        normal_gt_img = _load_prior(normal_dir, "normal", idx)
+        metallic_gt = _load_prior(metallic_dir, "metallic", idx)
+        roughness_gt = _load_prior(roughness_dir, "roughness", idx)
+
+        cam_infos.append(CameraInfo(
+            uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+            image_path=image_path, image_name=image_name,
+            width=image.size[0], height=image.size[1], exposure=0.0,
+            albedo_gt=albedo_gt_img, normal_gt=normal_gt_img,
+            metallic_gt=metallic_gt, roughness_gt=roughness_gt,
+            normal_in_camera_space=True))
+
+    cam_infos = sorted(cam_infos, key=lambda x: x.image_name)
+
+    if eval:
+        train_cam_infos = [c for i, c in enumerate(cam_infos) if i % llffhold != 0]
+        test_cam_infos = [c for i, c in enumerate(cam_infos) if i % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "sparse/0/points3D.ply")
+    bin_path = os.path.join(path, "sparse/0/points3D.bin")
+    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except Exception:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    try:
+        pcd = fetchPly(ply_path)
+    except Exception:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "SyntheticWithPriors": readSyntheticWithPriorsInfo,
+    "ColmapWithPriors": readColmapWithPriorsInfo,
 }
+

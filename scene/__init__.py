@@ -13,7 +13,7 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks, isSyntheticWithPriors
+from scene.dataset_readers import sceneLoadTypeCallbacks, isSyntheticWithPriors, isColmapWithPriors
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
@@ -41,7 +41,15 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        if isColmapWithPriors(args.source_path):
+            print("Found rgba/ + sparse/ without transforms_train.json, assuming real-world COLMAP-with-priors data set!")
+            scene_info = sceneLoadTypeCallbacks["ColmapWithPriors"](
+                args.source_path, args.eval,
+                albedo_dir=getattr(args, "albedo_gt_dir", "albedo"),
+                normal_dir=getattr(args, "normal_gt_dir", "normal"),
+                metallic_dir=getattr(args, "metallic_gt_dir", ""),
+                roughness_dir=getattr(args, "roughness_gt_dir", ""))
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif isSyntheticWithPriors(args.source_path):
             print("Found transforms_train.json + train/rgba/, assuming synthetic-with-priors data set!")

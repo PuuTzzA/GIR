@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -548,6 +549,19 @@ class GaussianModel:
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+        # Base (un-reduced) learning rates for the geometry parameters that are
+        # NOT otherwise scheduled. These are captured so the optional
+        # third-stage geometry-LR reduction (set_geo_lr_schedule) can scale them
+        # without losing the original value. xyz keeps its own exponential
+        # scheduler; the reduction multiplies that scheduled value.
+        self._base_scaling_lr = training_args.scaling_lr
+        self._base_rotation_lr = training_args.rotation_lr
+        # Geometry-LR reduction schedule (inert by default: factor stays 1.0).
+        self._geo_lr_reduce_factor = 1.0
+        self._geo_lr_start_iter = 0
+        self._geo_lr_final_iter = 0
+
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -570,13 +584,54 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.hdr_base_lr_delay_mult,
                                                     max_steps=training_args.hdr_base_lr_max_steps)
 
+    def set_geo_lr_schedule(self, start_iter, final_iter, reduce_factor):
+        """Configure an optional third-stage geometry learning-rate reduction.
+
+        The learning rates of the geometry parameters (xyz, scaling, rotation)
+        are gradually cosine-annealed from their full value (factor 1.0) down to
+        `reduce_factor` over the iteration window [start_iter, final_iter], then
+        held at `reduce_factor`. With reduce_factor == 1.0 the schedule is inert
+        (no change vs. the original behavior), which keeps the baseline exact.
+
+        Args:
+            start_iter:   iteration at which the reduction begins (e.g. the start
+                          of the PBR / third stage, second_stage_step).
+            final_iter:   iteration at which `reduce_factor` is fully reached.
+                          Values <= start_iter fall back to no reduction.
+            reduce_factor: final multiplier on the geometry LRs (e.g. 0.05).
+        """
+        self._geo_lr_reduce_factor = float(reduce_factor)
+        self._geo_lr_start_iter = int(start_iter)
+        self._geo_lr_final_iter = int(final_iter)
+
+    def _geo_lr_factor(self, iteration):
+        """Current multiplier on the geometry LRs for `iteration` (1.0 = full)."""
+        reduce_factor = self._geo_lr_reduce_factor
+        if reduce_factor == 1.0:
+            return 1.0
+        start = self._geo_lr_start_iter
+        final = self._geo_lr_final_iter
+        if final <= start:
+            return 1.0
+        if iteration <= start:
+            return 1.0
+        if iteration >= final:
+            return reduce_factor
+        t = (iteration - start) / float(final - start)
+        # Cosine ease from 1.0 -> reduce_factor.
+        return reduce_factor + (1.0 - reduce_factor) * 0.5 * (1.0 + math.cos(math.pi * t))
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
+        geo_factor = self._geo_lr_factor(iteration)
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
+                lr = self.xyz_scheduler_args(iteration) * geo_factor
                 param_group['lr'] = lr
+            if param_group["name"] == "scaling":
+                param_group['lr'] = self._base_scaling_lr * geo_factor
+            if param_group["name"] == "rotation":
+                param_group['lr'] = self._base_rotation_lr * geo_factor
             if param_group["name"] == "hdr_net":
                 lr = self.hdr_scheduler_args(max(0, iteration-5000))
                 param_group['lr'] = lr

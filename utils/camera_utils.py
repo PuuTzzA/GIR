@@ -71,7 +71,9 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device, exposure=cam_info.exposure,
                   albedo_gt=albedo_gt_tensor, normal_gt=normal_gt_tensor, metallic_gt=metallic_gt_tensor, roughness_gt=roughness_gt_tensor,
-                  image_path=cam_info.image_path)
+                  image_path=cam_info.image_path,
+                  normal_in_camera_space=getattr(cam_info, "normal_in_camera_space", False),
+                  normal_camera_convention=getattr(args, "normal_camera_convention", "opengl"))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

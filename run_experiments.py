@@ -45,23 +45,25 @@ schedule (priors are introduced gradually, geometry first):
         smoothness is unnecessary / harmful).
 
 ------------------------------------------------------------------------------
-THE SIX RUNS (lego, resolution 8)
+THE FOUR RUNS (lego, resolution 2, 60k iterations)
 ------------------------------------------------------------------------------
-    1. baseline_no_prior     : GIR baseline. Priors computed for logging only
-                               (NOT optimized), full TV losses, envmap
-                               regularizer ON, no prior scheduler.
-    2. tv_off_direct         : priors ON, "direct" albedo loss, TV losses for
-                               priored properties fully removed (factor 0.0).
-    3. tv_off_log_chroma     : as (2) but the log-intensity + chromaticity
-                               (intrinsic-image) albedo loss.
-    4. tv_low_direct         : priors ON, "direct" albedo loss, TV losses for
-                               priored properties almost removed (factor 0.05).
-    5. tv_low_log_chroma     : as (4) but the log_chroma albedo loss.
-    6. tv_low_direct_lambdas : as (4) but different GT-prior loss weights
-                               (lambda_*_gt) to probe their sensitivity.
+This batch keeps the priors SMALL (only albedo + normal GT; metallic / roughness
+priors stay OFF) and isolates the albedo prior formulation. The normal GT prior
+is handled exactly as before (cosine loss).
+
+    1. baseline_no_prior : GIR baseline. Priors computed for logging only
+                           (NOT optimized), full TV losses, envmap regularizer
+                           ON, no prior scheduler.
+    2. albedo_gradient   : NEW gradient-domain albedo prior. Matches the spatial
+                           gradient of the rendered albedo to the gradient of the
+                           GT albedo, so flat GT regions push the rendered albedo
+                           gradient to zero (and GT edges are reproduced).
+    3. albedo_direct     : "direct" albedo loss (Huber + DSSIM on raw values).
+    4. albedo_log_chroma : log-intensity + chromaticity (intrinsic-image) albedo
+                           loss.
 
    The per-channel least-squares albedo mode ("lstsq") is kept in the engine but
-   dropped from this batch (log_chroma consistently beats it).
+   dropped from this batch.
 
 ------------------------------------------------------------------------------
 USAGE
@@ -102,13 +104,16 @@ REPO_DIR = os.path.dirname(GIR_DIR)
 # docstring; densification / opacity-reset are arranged to FINISH well before
 # the end so nothing disturbs the final gaussians.
 LEGO_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "lego")
-COMMON = {
-    "source_path": LEGO_DIR,
-    "eval": True,                 # hold out the test cameras for novel-view eval
-    "white_background": False,    # lego is a Blender-synthetic scene
-    "resolution": 2,               # default: -1     | -1 = keep native resolution
+REAL_LIFE_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "bicycle")
 
-    "iterations": 60_000,          # total iterations (passable quality, not too slow)
+LEGO_DIR_RELIGHT_HDRs = ["fireplace", "night", "snow"]  # HDRIs for blender datasets (lego, armadillo)
+REAL_LIFE_DIR_RELIGHT_HDRs = []                          # real photos: no relight GT, so empty
+
+COMMON = {
+    "eval": True,                 # hold out the test cameras for novel-view eval
+    "random_background": False,   # default: False
+
+    "iterations": 45_000,          # total iterations (good-GPU run)
 
     # ── 3-phase schedule ────────────────────────────────────────────────
     #   Phase 1 GEOMETRY        : iter 0    .. 2000   (radiance warm-up)
@@ -126,115 +131,193 @@ COMMON = {
     "densification_interval": 100,   # default: 100
     "opacity_reset_interval": 3000,  # resets only at 3000 & 6000 (< densify_until_iter)
     "densify_from_iter": 500,        # default: 500
-    "densify_until_iter": 45_000,    # default: 45_000
+    "densify_until_iter": 38_000,    # default: 45_000
     "densify_grad_threshold": 0.0002,# default: 0.0002
     "max_gaussians": 300_000,        # hard cap on #gaussians (0 = unlimited)
-    "random_background": False,      # default: False
 
     "eval_interval": 2_000,          # evaluate metrics every N iters
     "visual_interval": 5_000,        # save visual comparisons every N iters
 
-    # HDRIs available for lego (rgba_<name> folders + hdris/<name>.hdr).
-    "eval_relight_hdris": ["fireplace", "night", "snow"], # HDRIs for blender datasets (lego, armadillo)
-    # "eval_relight_hdris": ["gym_entrance", "moonless_night", "snowy_forest"], # HDRIs for our own synthetic datasets (cube, cube_colorful, sphere, sphere_colorful)
-
     # Keep disk usage small: only save/checkpoint at the very end.
-    "save_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000], #[12_000],
-    "test_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000],
-    "checkpoint_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000],
-
-    # Which sub-folder under each split to read each GT prior from. Pick any
-    # available variant per property, e.g. for albedo: "albedo_gt" | "albedo_video"
-    # | "albedo". Set to "" to DISABLE that prior entirely (its loss weight below
-    # is forced to 0). lego has no metallic_gt/roughness_gt folders, so those are
-    # left "" here -- the OLD code silently supervised metallic toward a constant
-    # 0.0 and skipped roughness. Switch to "metallic"/"metallic_video" (estimated,
-    # not GT) if you want to supervise them.
-    "albedo_gt_dir": "albedo_gt",
-    "normal_gt_dir": "normal_gt",
-    "metallic_gt_dir": "",
-    "roughness_gt_dir": "",
+    # Denser cadence around 40-50k so the best relight checkpoint (which for the
+    # baseline peaks ~44k before the post-densify overfit) is captured.
+    "save_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
+    "test_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
+    "checkpoint_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
 
     # Prior loss weights (used by every run that optimizes the priors).
-    # A weight is auto-forced to 0 when its *_gt_dir above is "".
+    # A weight is auto-forced to 0 when its *_gt_dir (set per-dataset) is "".
     "lambda_albedo_gt": 0.25,
     "lambda_normal_gt": 0.8,
     "lambda_metallic_gt": 0.05,
     "lambda_roughness_gt": 0.05,
 
-    # Up-then-down prior schedule (Phase 3 only): warm up over the first 15% of
-    # the PBR stage, then cosine-decay back down to 50% of the max weight.
+    # Prior weight schedule (Phase 3 only): warm up over the first 15% of the
+    # PBR stage, then linearly interpolate from the full weight (1.0) to
+    # `prior_weight_final_ratio` over the rest. 1.0 = warm up then HOLD at full
+    # strength (no down-ramp); the old up-then-down decay used 0.5.
     "prior_weight_scheduler_ratio": 0.15,
-    "prior_weight_floor_ratio": 0.5,
+    "prior_weight_final_ratio": 1.0,
 
     # Robust Huber delta for the prior losses.
     "huber_delta": 0.2,
 
-    # Default albedo prior formulation; overridden per experiment below.
+    # Default albedo prior formulation; overridden per albedo variant below.
     "albedo_prior_mode": "direct",
 
     # TV / smoothness reduction for properties that have a GT prior. 1.0 keeps
-    # the regularizer at full strength (baseline); per-experiment overrides lower
+    # the regularizer at full strength (baseline); per-variant overrides lower
     # or remove it. Properties WITHOUT a GT prior always keep full TV.
     "tv_reduction_factor": 1.0,
+
+    # Third-stage geometry-LR reduction (xyz / scaling / rotation), cosine from
+    # second_stage_step to geo_lr_final_iter. 1.0 = off (baseline / reference);
+    # per-experiment overrides anneal it down to curb late light-baking.
+    "reduce_geo_lr_third_stage": 1.0,
+    "geo_lr_final_iter": 45_000,
+
+    # Skip opacity resets once iter > second_stage_step. Off by default; one
+    # experiment toggles it for the reset A/B.
+    "disable_reset_third_stage": False,
 
     # Envmap-neutrality regularizer. Kept small for prior runs (GT albedo helps
     # resolve the albedo/light-colour ambiguity); baseline raises it slightly.
     "reg_hdr_weight": 0.0001,
-
-    # GT base-light HDRI for the environment-map recovery metric (lego = sunset).
-    "envmap_gt_path": os.path.join(LEGO_DIR, "hdris", "sunset.hdr"),
 }
 
-# Where all run folders for this batch live.
-EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "experiment_tv_low_direct_60k")
-
-# Each experiment = a display name + a dict of args that OVERRIDE / EXTEND COMMON.
-# `flags` are boolean store_true switches passed only when True.
-EXPERIMENTS = [
+# =============================================================================
+# DATASETS  -- per-dataset overrides applied on top of COMMON
+# =============================================================================
+# Each dataset supplies its own source path, resolution, prior-folder names,
+# relight HDRIs and (for synthetic data) the GT base-light envmap. The same
+# four albedo variants below are run on every dataset.
+#
+# lego    : Blender synthetic-with-priors. Real GT albedo/normal in WORLD space
+#           ("albedo_gt"/"normal_gt"), relighting GT available, sunset base HDRI.
+# bicycle : real-world COLMAP-with-priors. NO real GT (estimated priors only) so
+#           albedo="albedo", normal="normal"; the normals are in CAMERA space and
+#           are rotated to world space at train time (normal_camera_convention).
+#           No relight GT and no GT base HDRI, so those are left empty.
+DATASETS = [
     {
-        # GIR baseline: priors for logging only, full TV losses, envmap
-        # regularizer at its paper value, no prior scheduler.
+        "name": "lego",
+        "args": {
+            "source_path": LEGO_DIR,
+            "white_background": False,         # lego is a Blender-synthetic scene
+            "resolution": 4,                   # -1 = keep native resolution
+            "albedo_gt_dir": "albedo_gt",      # WORLD-space GT albedo
+            "normal_gt_dir": "normal_gt",      # WORLD-space GT normal
+            "metallic_gt_dir": "",
+            "roughness_gt_dir": "",
+            "eval_relight_hdris": LEGO_DIR_RELIGHT_HDRs,
+            "envmap_gt_path": os.path.join(LEGO_DIR, "hdris", "sunset.hdr"),
+        },
+    },
+    #{
+    #    "name": "bicycle",
+    #    "args": {
+    #        "source_path": REAL_LIFE_DIR,
+    #        "white_background": False,
+    #        "resolution": 4,
+    #        # Real photos: no ground truth, use the ESTIMATED priors. Change
+    #        # these to "*_video" to use the video-consistent variants instead.
+    #        "albedo_gt_dir": "albedo",
+    #        "normal_gt_dir": "normal",
+    #        "metallic_gt_dir": "",
+    #        "roughness_gt_dir": "",
+    #        # The COLMAP normal priors are in camera/view space; this controls
+    #        # how they are mapped to camera axes before being rotated to world
+    #        # space ("opengl" = flip Y,Z; "opencv"/"colmap" = no flip).
+    #        "normal_camera_convention": "opengl",
+    #        "eval_relight_hdris": REAL_LIFE_DIR_RELIGHT_HDRs,  # empty -> no relight eval
+    #        "envmap_gt_path": "",                              # no GT base light
+    #     },
+    #},
+]
+
+# =============================================================================
+# ALBEDO VARIANTS  -- the baseline + three albedo-prior formulations
+# =============================================================================
+# Each variant overrides only the albedo handling; all other settings come from
+# COMMON / the dataset. The three new formulations isolate WHAT the albedo prior
+# supervises (edges / relative distribution / structure) while staying invariant
+# to the global brightness / colour shift between Cycles and the GIR BRDF.
+ALBEDO_VARIANTS = [
+    {
+        # GIR baseline: priors computed for logging only (NOT optimized), full TV
+        # losses, envmap regularizer at its paper value, no prior scheduler.
         "name": "baseline_no_prior",
         "args": {"reg_hdr_weight": 0.001, "tv_reduction_factor": 1.0},
         "flags": {"exclude_prior_loss": True},
     },
     #{
-    #    # Priors ON, direct albedo loss, TV losses for priored props REMOVED.
-    #    "name": "tv_off_direct",
-    #    "args": {"albedo_prior_mode": "direct", "tv_reduction_factor": 0.0},
-    #    "flags": {"use_prior_weight_scheduler": True},
-    #},
-    #{
-    #    # Priors ON, log_chroma albedo loss, TV losses for priored props REMOVED.
-    #    "name": "tv_off_log_chroma",
-    #    "args": {"albedo_prior_mode": "log_chroma", "tv_reduction_factor": 0.0},
+    #    # (1) Spatial-gradient / edge loss: match the rendered albedo gradient to
+    #    # the GT albedo gradient (L1). Ignores any global brightness/colour shift
+    #    # and only forces texture boundaries / edges into the right places.
+    #    "name": "albedo_gradient",
+    #    "args": {"albedo_prior_mode": "gradient", "tv_reduction_factor": 0.75},
     #    "flags": {"use_prior_weight_scheduler": True},
     #},
     {
-        # Priors ON, direct albedo loss, TV losses ALMOST removed (5%).
-        "name": "tv_low_direct",
-        "args": {"albedo_prior_mode": "direct", "tv_reduction_factor": 0.05},
+        # (2) Scale-and-shift-invariant loss (ZNCC / Pearson): standardise both
+        # albedos per channel (mean 0, std 1) before comparing, so the GIR albedo
+        # may be proportionally brighter / darker / different contrast.
+        "name": "albedo_zncc",
+        "args": {"albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.001},
+        "flags": {"use_prior_weight_scheduler": True},
+    },
+    {
+        # (2) Scale-and-shift-invariant loss (ZNCC / Pearson): standardise both
+        # albedos per channel (mean 0, std 1) before comparing, so the GIR albedo
+        # may be proportionally brighter / darker / different contrast.
+        "name": "albedo_zncc_reg_hdr",
+        "args": {"albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.001},
         "flags": {"use_prior_weight_scheduler": True},
     },
     #{
-    #    # Priors ON, log_chroma albedo loss, TV losses ALMOST removed (5%).
-    #    "name": "tv_low_log_chroma",
-    #    "args": {"albedo_prior_mode": "log_chroma", "tv_reduction_factor": 0.05},
+    #    # (3) Structure-focused SSIM: SSIM on the albedo with the luminance term
+    #    # heavily down-weighted, so shapes / textures must match the GT but the
+    #    # overall brightness / contrast may drift.
+    #    "name": "albedo_ssim_struct",
+    #    "args": {"albedo_prior_mode": "ssim_struct", "tv_reduction_factor": 0.75},
     #    "flags": {"use_prior_weight_scheduler": True},
     #},
     #{
-    #    # As tv_low_direct but different GT-prior loss weights (sensitivity probe).
-    #    "name": "tv_low_direct_lambdas",
-    #    "args": {
-    #        "albedo_prior_mode": "direct",
-    #        "tv_reduction_factor": 0.05,
-    #        "lambda_albedo_gt": 0.4,
-    #        "lambda_normal_gt": 0.5,
-    #    },
+    #    # (4) Locally-normalised cross-correlation (relight-focused refinement of
+    #    # zncc): standardise both albedos inside a sliding Gaussian window so the
+    #    # loss is invariant to SPATIALLY-VARYING gain. Removes smooth baked
+    #    # shading the global zncc leaves behind, keeping illumination out of the
+    #    # recovered albedo for cleaner relighting.
+    #    "name": "albedo_zncc_local",
+    #    "args": {"albedo_prior_mode": "zncc_local", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0007},
     #    "flags": {"use_prior_weight_scheduler": True},
     #},
+    {
+        # (5) Gradient-domain ZNCC (relight-focused refinement of zncc): match
+        # the scale-&-shift-invariant correlation of the albedo SPATIAL GRADIENTS
+        # so low-frequency baked shading is differentiated away and only
+        # high-frequency texture edges are supervised.
+        "name": "albedo_zncc_grad",
+        "args": {"albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0007},
+        "flags": {"use_prior_weight_scheduler": True},
+    },
 ]
+
+# Where all run folders for this batch live.
+EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_1")
+
+# Build the 8 experiments = every albedo variant on every dataset. Each
+# experiment merges dataset args first, then the variant args (variant wins).
+EXPERIMENTS = []
+for _dataset in DATASETS:
+    for _variant in ALBEDO_VARIANTS:
+        _args = dict(_dataset["args"])
+        _args.update(_variant.get("args", {}))
+        EXPERIMENTS.append({
+            "name": f"{_dataset['name']}_{_variant['name']}",
+            "args": _args,
+            "flags": dict(_variant.get("flags", {})),
+        })
 
 # =============================================================================
 # RUN LAUNCHING
@@ -256,6 +339,7 @@ def build_command(exp, model_path):
     bool_flags = {
         "eval", "white_background", "exclude_prior_loss", "use_prior_weight_scheduler",
         "remove_noise", "hdr_rotation", "random_background", "quiet",
+        "disable_reset_third_stage",
     }
 
     flags = dict(exp.get("flags", {}))
@@ -269,6 +353,11 @@ def build_command(exp, model_path):
     cmd += ["--model_path", model_path]
 
     for key, value in cfg.items():
+        # An empty list (e.g. eval_relight_hdris=[] for real-world data) would
+        # produce a "--flag" with no values, which argparse nargs="+" rejects.
+        # Skip it so the engine falls back to its default / no-op behaviour.
+        if isinstance(value, (list, tuple)) and len(value) == 0:
+            continue
         cmd.append(f"--{key}")
         cmd += _fmt_value(value)
 

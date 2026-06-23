@@ -132,6 +132,12 @@ CONFIG = {
     "tv_reduction_factor": 1.0,      # default: 1.0    | scale (0..1) for a property's TV/smoothness
                                      #                  | regularizer when that property has a GT prior
                                      #                  | (0 = off, 1 = unchanged). Only affects priored props.
+    "reduce_geo_lr_third_stage": 1.0, # default: 1.0   | final multiplier on geometry LRs (xyz/scaling/
+                                     #                  | rotation), cosine-annealed across the 3rd stage.
+                                     #                  | 1.0 = off, e.g. 0.05 = reduce to 5%.
+    "geo_lr_final_iter": 0,           # default: 0      | iter at which reduce_geo_lr_third_stage is
+                                     #                  | reached (<=0 = end of training).
+    "disable_reset_third_stage": False, # default: False | skip opacity resets when iter > second_stage_step.
 
     # ----------------------------------------------------------------------
     # Priors - GT prior supervision ADDED to the engine
@@ -143,6 +149,8 @@ CONFIG = {
     "lambda_roughness_gt": 0.05,     # default: 0.05   | fixed weight for roughness GT-prior loss
     "use_prior_weight_scheduler": True, # default: True  | ramp up prior and envmap weights
     "prior_weight_scheduler_ratio": 0.15, # default: 0.15  | fraction of post-second-stage steps for warmup
+    "prior_weight_final_ratio": 1.0, # default: 1.0    | value the schedule ramps to after warm-up.
+                                     #                  | 1.0 = hold, >1 = increase, <1 = decay (0.5 = old).
     "exclude_prior_loss": False,     # default: False  | compute prior losses for logging only,
                                      #                  | but do NOT backprop them (no-prior ablation)
 
@@ -201,6 +209,9 @@ def build_args():
     parser.add_argument("--reg_hdr_weight", type=float)
     parser.add_argument("--reg_material_weight", type=float)
     parser.add_argument("--tv_reduction_factor", type=float)
+    parser.add_argument("--reduce_geo_lr_third_stage", type=float)
+    parser.add_argument("--geo_lr_final_iter", type=int)
+    parser.add_argument("--disable_reset_third_stage", action="store_true", default=None)
     parser.add_argument("--eval_interval", type=int)
     parser.add_argument("--visual_interval", type=int)
     parser.add_argument("--lambda_albedo_gt", type=float)
@@ -209,6 +220,7 @@ def build_args():
     parser.add_argument("--lambda_roughness_gt", type=float)
     parser.add_argument("--use_prior_weight_scheduler", action="store_true", default=None)
     parser.add_argument("--prior_weight_scheduler_ratio", type=float)
+    parser.add_argument("--prior_weight_final_ratio", type=float)
     parser.add_argument("--exclude_prior_loss", action="store_true", default=None)
     parser.add_argument("--eval_relight_hdris", nargs="+", type=str)
 
@@ -274,9 +286,13 @@ def main():
         lambda_roughness_gt=args.lambda_roughness_gt,
         use_prior_weight_scheduler=args.use_prior_weight_scheduler,
         prior_weight_scheduler_ratio=args.prior_weight_scheduler_ratio,
+        prior_weight_final_ratio=args.prior_weight_final_ratio,
         exclude_prior_loss=args.exclude_prior_loss,
         eval_relight_hdris=args.eval_relight_hdris,
         tv_reduction_factor=args.tv_reduction_factor,
+        reduce_geo_lr_third_stage=args.reduce_geo_lr_third_stage,
+        geo_lr_final_iter=args.geo_lr_final_iter,
+        disable_reset_third_stage=args.disable_reset_third_stage,
     )
 
     print("\nTraining complete.")

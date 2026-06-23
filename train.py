@@ -16,7 +16,7 @@ import time
 import torch
 import torch.nn.functional as F
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim, smooth_loss, regularizer_loss, get_mask, tv_loss, huber_loss, albedo_prior_loss
+from utils.loss_utils import l1_loss, l2_loss, ssim, smooth_loss, regularizer_loss, get_mask, tv_loss, huber_loss, albedo_prior_loss, decode_normal_to_world
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -73,10 +73,12 @@ def load_relighted_gt(viewpoint, hdri_name, white_background):
     resolution = (viewpoint.image_width, viewpoint.image_height)
     resized_tensor = PILtoTorch(img_rgba, resolution)
 
+    # The RGB channels are already composited over `bg` above (matching the
+    # background the model renders against), so we return them directly. We must
+    # NOT re-multiply by the alpha mask here: that would force the background to
+    # black and create a mismatch against the rendered image whenever
+    # white_background is True (penalizing relight PSNR/SSIM on white-bg scenes).
     gt_image = resized_tensor[:3, ...].clamp(0.0, 1.0).to(viewpoint.data_device)
-    if resized_tensor.shape[0] == 4:
-        mask = resized_tensor[3:4, ...].to(viewpoint.data_device)
-        gt_image *= mask
 
     return gt_image
 
@@ -130,6 +132,19 @@ def envmap_recovery_metrics(envlight_base, gt_hdr_path):
     rel_l1 = ((aligned - gt).abs().sum() / gt.abs().sum().clamp_min(1e-6)).item()
     return log_psnr, rel_l1
 
+def gt_normal_world(viewpoint, gt_normal):
+    """Decode a viewpoint's GT normal prior into a unit WORLD-space normal.
+
+    For synthetic priors this is just (x*2-1) normalised; for real-world COLMAP
+    priors (flagged `normal_in_camera_space`) the camera->world rotation stored
+    on the camera is applied so the prior lines up with GIR's world normals.
+    """
+    return decode_normal_to_world(
+        gt_normal,
+        camera_space=getattr(viewpoint, "normal_in_camera_space", False),
+        R_cam2world=getattr(viewpoint, "R_cam2world", None),
+        convention=getattr(viewpoint, "normal_camera_convention", "opengl"))
+
 def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False, run_relighting_eval=False, eval_relight_hdris=[], envmap_gt_path=""):
     """Evaluate metrics on test and train cameras at the current iteration."""
     torch.cuda.empty_cache()
@@ -148,6 +163,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
         psnr_vals, ssim_vals, lpips_vals, l1_vals, mse_vals = [], [], [], [], []
         psnr_aligned_vals = []
         albedo_psnr_vals, albedo_ssim_vals, albedo_l1_vals = [], [], []
+        albedo_psnr_aligned_vals = []
         normal_angular_error_vals = []
         metallic_mae_vals, roughness_mae_vals = [], []
         visual_pairs = []  # (render, gt) for visual comparison
@@ -174,6 +190,11 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                 if rendered_albedo is not None:
                     rendered_albedo_clamped = torch.clamp(rendered_albedo, 0.0, 1.0)
                     albedo_psnr_vals.append(psnr(rendered_albedo_clamped, gt_albedo).mean().item())
+                    # Scale-aligned albedo PSNR: removes a single global gain
+                    # before comparing, so albedo modes that only recover
+                    # relative structure / colour (log_chroma, gradient) are
+                    # judged on decomposition quality rather than absolute scale.
+                    albedo_psnr_aligned_vals.append(scale_aligned_psnr(rendered_albedo_clamped, gt_albedo))
                     albedo_ssim_vals.append(ssim(rendered_albedo_clamped, gt_albedo).item())
                     albedo_l1_vals.append(l1_loss(rendered_albedo_clamped, gt_albedo).item())
 
@@ -182,12 +203,20 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                 rendered_normal = render_pkg.get("rendered_normal", None)
                 if rendered_normal is not None:
                     pred_n = rendered_normal * 2.0 - 1.0
-                    gt_n = gt_normal * 2.0 - 1.0
                     pred_n = F.normalize(pred_n, p=2, dim=0)
-                    gt_n = F.normalize(gt_n, p=2, dim=0)
+                    gt_n = gt_normal_world(viewpoint, gt_normal)
                     cos_sim = torch.clamp(torch.sum(pred_n * gt_n, dim=0), -1.0, 1.0)
                     ang_error = torch.acos(cos_sim) * 180.0 / 3.141592653589793
-                    normal_angular_error_vals.append(ang_error.mean().item())
+                    # Restrict to the object silhouette. Background pixels carry
+                    # no meaningful normal (rendered normal is ~0 there -> 90 deg
+                    # error), which would otherwise dominate and inflate the mean.
+                    alpha_map = render_pkg.get("alpha", None)
+                    if alpha_map is not None:
+                        fg = (alpha_map.squeeze(0) > 0.5).to(ang_error.dtype)
+                        denom = fg.sum().clamp_min(1.0)
+                        normal_angular_error_vals.append(((ang_error * fg).sum() / denom).item())
+                    else:
+                        normal_angular_error_vals.append(ang_error.mean().item())
 
             # Per-channel material errors (metallic / roughness), when GT exists.
             rendered_metallic = render_pkg.get("rendered_metallic", None)
@@ -227,6 +256,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
 
         if albedo_psnr_vals:
             results[f"{prefix}_albedo_psnr"] = sum(albedo_psnr_vals) / len(albedo_psnr_vals)
+            results[f"{prefix}_albedo_psnr_aligned"] = sum(albedo_psnr_aligned_vals) / len(albedo_psnr_aligned_vals)
             results[f"{prefix}_albedo_ssim"] = sum(albedo_ssim_vals) / len(albedo_ssim_vals)
             results[f"{prefix}_albedo_l1"] = sum(albedo_l1_vals) / len(albedo_l1_vals)
         if normal_angular_error_vals:
@@ -293,6 +323,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                         relight_psnr_vals = []
                         relight_psnr_aligned_vals = []
                         relight_ssim_vals = []
+                        relight_lpips_vals = []
                         relight_save_pairs = []
 
                         try:
@@ -317,6 +348,10 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                                 relight_psnr_vals.append(psnr(image, gt_relight).mean().item())
                                 relight_psnr_aligned_vals.append(scale_aligned_psnr(image, gt_relight))
                                 relight_ssim_vals.append(ssim(image, gt_relight).item())
+                                with torch.no_grad():
+                                    relight_lpips_vals.append(lpips_model(
+                                        image.unsqueeze(0) if image.dim() == 3 else image,
+                                        gt_relight.unsqueeze(0) if gt_relight.dim() == 3 else gt_relight).item())
 
                                 if save_visuals and idx < 3:
                                     relight_save_pairs.append((viewpoint.image_name, image.detach().cpu(), gt_relight.detach().cpu()))
@@ -339,6 +374,9 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                             results[f"relight_{hdri_name}_psnr"] = avg_psnr
                             results[f"relight_{hdri_name}_psnr_aligned"] = avg_psnr_aligned
                             results[f"relight_{hdri_name}_ssim"] = avg_ssim
+                            if relight_lpips_vals:
+                                avg_lpips = sum(relight_lpips_vals) / len(relight_lpips_vals)
+                                results[f"relight_{hdri_name}_lpips"] = avg_lpips
 
                             print(f"  HDRI {hdri_name:20s} — PSNR: {avg_psnr:.2f} (aligned {avg_psnr_aligned:.2f}), SSIM: {avg_ssim:.4f}")
                             sys.stdout.flush()
@@ -373,7 +411,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=False, prior_weight_scheduler_ratio=0.15, prior_weight_floor_ratio=0.5, albedo_prior_mode="direct", huber_delta=0.1, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace'], envmap_gt_path="", tv_reduction_factor=1.0):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=False, prior_weight_scheduler_ratio=0.15, prior_weight_final_ratio=1.0, albedo_prior_mode="direct", huber_delta=0.1, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace'], envmap_gt_path="", tv_reduction_factor=1.0, reduce_geo_lr_third_stage=1.0, geo_lr_final_iter=0, disable_reset_third_stage=False):
     # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
     # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
     user_eval_set = (eval_interval != 2000)
@@ -415,6 +453,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    # Optional third-stage geometry-LR reduction (xyz / scaling / rotation). The
+    # final iteration defaults to the end of training when not set (<=0). Inert
+    # when reduce_geo_lr_third_stage == 1.0, so the baseline is unaffected.
+    _geo_lr_final_iter = geo_lr_final_iter if geo_lr_final_iter and geo_lr_final_iter > 0 else opt.iterations
+    gaussians.set_geo_lr_schedule(second_stage_step, _geo_lr_final_iter, reduce_geo_lr_third_stage)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -541,12 +584,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration > second_stage_step:
             multiplier = 1.0
             if use_prior_weight_scheduler:
-                # Up-then-down schedule for the prior / envmap-regularizer weights:
+                # Up-then-hold/(in/de)crease schedule for the prior / envmap-reg
+                # weights:
                 #   * linearly ramp 0 -> 1 over the first `prior_weight_scheduler_ratio`
                 #     fraction of the PBR stage (let the decomposition settle first),
-                #   * then cosine-decay 1 -> `prior_weight_floor_ratio` over the rest so
-                #     the priors keep a strong-but-reduced pull (default floor = 0.5x)
-                #     and let the photometric / relighting objective own the final values.
+                #   * then linearly interpolate 1 -> `prior_weight_final_ratio` over the
+                #     rest. final == 1.0 HOLDS the priors at full strength (recommended
+                #     for relighting, so the GT prior keeps constraining the late phase
+                #     where the model otherwise overfits the single training light);
+                #     final > 1.0 INCREASES the pull; final < 1.0 reproduces the old
+                #     decay-toward-a-floor behavior (e.g. 0.5).
                 total_second_stage_steps = opt.iterations - second_stage_step
                 warmup_steps = int(prior_weight_scheduler_ratio * total_second_stage_steps)
                 progress = iteration - second_stage_step
@@ -556,8 +603,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     decay_steps = total_second_stage_steps - warmup_steps
                     if decay_steps > 0:
                         t = min(max(float(progress - warmup_steps) / float(decay_steps), 0.0), 1.0)
-                        floor = prior_weight_floor_ratio
-                        multiplier = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * t))
+                        final = prior_weight_final_ratio
+                        multiplier = 1.0 + (final - 1.0) * t
                     else:
                         multiplier = 1.0
 
@@ -585,7 +632,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         loss_albedo_gt_val = l1_loss(rendered_albedo, gt_albedo)
                     if gt_normal is not None:
                         pred_n = rendered_normal * 2.0 - 1.0
-                        gt_n = gt_normal * 2.0 - 1.0
+                        gt_n = gt_normal_world(viewpoint_cam, gt_normal)
                         cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
                         loss_normal_gt_val = (1.0 - cos_sim).mean()
                     if gt_metallic is not None:
@@ -608,7 +655,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if gt_normal is not None:
                     pred_n = rendered_normal * 2.0 - 1.0
-                    gt_n = gt_normal * 2.0 - 1.0
+                    gt_n = gt_normal_world(viewpoint_cam, gt_normal)
                     cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
                     prior_normal = (1.0 - cos_sim).mean()
                     loss_normal_gt_val = prior_normal.detach()
@@ -648,7 +695,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_normal = getattr(viewpoint_cam, 'normal_gt', None)
                 if gt_normal is not None:
                     pred_n = rendered_normal * 2.0 - 1.0
-                    gt_n = gt_normal * 2.0 - 1.0
+                    gt_n = gt_normal_world(viewpoint_cam, gt_normal)
                     cos_sim = F.cosine_similarity(pred_n, gt_n, dim=0)
                     prior_normal = (1.0 - cos_sim).mean()
                     loss_normal_gt_val = prior_normal.detach()
@@ -820,7 +867,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent * alpha_, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    # Optionally skip opacity resets in the third (PBR) stage: by
+                    # then the geometry is settled, and a hard reset can disturb
+                    # the decomposition. A/B-controlled via disable_reset_third_stage.
+                    if not (disable_reset_third_stage and iteration > second_stage_step):
+                        gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -949,13 +1000,16 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_roughness_gt", type=float, default=0.05, help="Weight for roughness GT loss")
     parser.add_argument("--use_prior_weight_scheduler", action="store_true", default=False, help="Ramp prior/envmap-reg weights up then partially back down (off = constant weights)")
     parser.add_argument("--prior_weight_scheduler_ratio", type=float, default=0.15, help="Warm-up ratio (fraction of PBR-stage steps spent ramping 0->1)")
-    parser.add_argument("--prior_weight_floor_ratio", type=float, default=0.5, help="Floor the schedule decays to after warm-up (fraction of max weight)")
-    parser.add_argument("--albedo_prior_mode", type=str, default="direct", choices=["direct", "lstsq", "log_chroma"], help="Albedo prior formulation: direct | lstsq (per-channel gain align) | log_chroma (log+chromaticity)")
+    parser.add_argument("--prior_weight_final_ratio", type=float, default=1.0, help="Value the prior/envmap weight schedule ramps to after warm-up (fraction of max weight). 1.0 = hold at full strength, >1 = increase, <1 = decay toward a floor (e.g. 0.5 = old behavior)")
+    parser.add_argument("--albedo_prior_mode", type=str, default="direct", choices=["direct", "lstsq", "log_chroma", "gradient", "zncc", "zncc_local", "zncc_grad", "ssim_struct"], help="Albedo prior formulation: direct | lstsq (per-channel gain align) | log_chroma (log+chromaticity) | gradient (spatial-gradient/edge) | zncc (scale-&-shift-invariant) | zncc_local (locally-normalised correlation) | zncc_grad (gradient-domain correlation) | ssim_struct (structure-focused SSIM)")
     parser.add_argument("--huber_delta", type=float, default=0.1, help="Delta for the robust Huber prior losses")
     parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
     parser.add_argument("--eval_relight_hdris", nargs="+", type=str, default=['snowy_forest', 'moonless_night', 'fireplace'], help="List of HDRI names to evaluate relighting on")
     parser.add_argument("--envmap_gt_path", type=str, default="", help="Path to the GT base-light HDRI for the environment-map recovery metric (optional)")
     parser.add_argument("--tv_reduction_factor", type=float, default=1.0, help="Scale (0..1) applied to a property's TV/smoothness regularizer when that property has a GT prior (0 = off, 1 = unchanged)")
+    parser.add_argument("--reduce_geo_lr_third_stage", type=float, default=1.0, help="Final multiplier on geometry LRs (xyz/scaling/rotation), cosine-annealed across the third stage. 1.0 = off (no change), e.g. 0.05 = reduce to 5%%")
+    parser.add_argument("--geo_lr_final_iter", type=int, default=0, help="Iteration at which reduce_geo_lr_third_stage is fully reached (<=0 means end of training)")
+    parser.add_argument("--disable_reset_third_stage", action="store_true", default=False, help="Skip opacity resets once iteration > second_stage_step (third / PBR stage)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -978,7 +1032,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.prior_weight_floor_ratio, args.albedo_prior_mode, args.huber_delta, args.exclude_prior_loss, args.eval_relight_hdris, args.envmap_gt_path, args.tv_reduction_factor)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.prior_weight_final_ratio, args.albedo_prior_mode, args.huber_delta, args.exclude_prior_loss, args.eval_relight_hdris, args.envmap_gt_path, args.tv_reduction_factor, args.reduce_geo_lr_third_stage, args.geo_lr_final_iter, args.disable_reset_third_stage)
 
     # All done
     print("\nTraining complete.")
