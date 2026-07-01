@@ -85,6 +85,8 @@ import sys
 import json
 import glob
 import shlex
+import shutil
+import hashlib
 import argparse
 import subprocess
 from datetime import datetime
@@ -106,14 +108,14 @@ REPO_DIR = os.path.dirname(GIR_DIR)
 LEGO_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "lego")
 REAL_LIFE_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "bicycle")
 
-LEGO_DIR_RELIGHT_HDRs = ["fireplace", "night", "snow"]  # HDRIs for blender datasets (lego, armadillo)
+LEGO_DIR_RELIGHT_HDRs = ["fireplace", "night", "snow", "city", "courtyard"]  # HDRIs for blender datasets (lego, armadillo)
 REAL_LIFE_DIR_RELIGHT_HDRs = []                          # real photos: no relight GT, so empty
 
 COMMON = {
     "eval": True,                 # hold out the test cameras for novel-view eval
     "random_background": False,   # default: False
 
-    "iterations": 45_000,          # total iterations (good-GPU run)
+    "iterations": 60_000,          # total iterations (good-GPU run)
 
     # ── 3-phase schedule ────────────────────────────────────────────────
     #   Phase 1 GEOMETRY        : iter 0    .. 2000   (radiance warm-up)
@@ -131,25 +133,25 @@ COMMON = {
     "densification_interval": 100,   # default: 100
     "opacity_reset_interval": 3000,  # resets only at 3000 & 6000 (< densify_until_iter)
     "densify_from_iter": 500,        # default: 500
-    "densify_until_iter": 38_000,    # default: 45_000
+    "densify_until_iter": 45_000,    # default: 45_000
     "densify_grad_threshold": 0.0002,# default: 0.0002
-    "max_gaussians": 300_000,        # hard cap on #gaussians (0 = unlimited)
+    "max_gaussians": 450_000,        # hard cap on #gaussians (0 = unlimited)
 
-    "eval_interval": 2_000,          # evaluate metrics every N iters
+    "eval_interval": 5_000,          # evaluate metrics every N iters
     "visual_interval": 5_000,        # save visual comparisons every N iters
 
     # Keep disk usage small: only save/checkpoint at the very end.
     # Denser cadence around 40-50k so the best relight checkpoint (which for the
     # baseline peaks ~44k before the post-densify overfit) is captured.
-    "save_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
-    "test_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
-    "checkpoint_iterations": [5_000, 10_000, 20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
+    "save_iterations": [20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
+    "test_iterations": [20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
+    "checkpoint_iterations": [20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
 
     # Prior loss weights (used by every run that optimizes the priors).
     # A weight is auto-forced to 0 when its *_gt_dir (set per-dataset) is "".
     "lambda_albedo_gt": 0.25,
     "lambda_normal_gt": 0.8,
-    "lambda_metallic_gt": 0.05,
+    "lambda_metallic_gt": 0.15,
     "lambda_roughness_gt": 0.05,
 
     # Prior weight schedule (Phase 3 only): warm up over the first 15% of the
@@ -163,7 +165,11 @@ COMMON = {
     "huber_delta": 0.2,
 
     # Default albedo prior formulation; overridden per albedo variant below.
+    # In albedo geometry warm-up runs this is the STAGE-3 (PBR) formulation;
+    # `warmup_albedo_prior_mode` selects a (possibly different) formulation for
+    # the warm-up stages 1 & 2. Empty string = reuse `albedo_prior_mode`.
     "albedo_prior_mode": "direct",
+    "warmup_albedo_prior_mode": "direct",
 
     # TV / smoothness reduction for properties that have a GT prior. 1.0 keeps
     # the regularizer at full strength (baseline); per-variant overrides lower
@@ -204,10 +210,10 @@ DATASETS = [
         "args": {
             "source_path": LEGO_DIR,
             "white_background": False,         # lego is a Blender-synthetic scene
-            "resolution": 4,                   # -1 = keep native resolution
+            "resolution": 2,                   # -1 = keep native resolution
             "albedo_gt_dir": "albedo_gt",      # WORLD-space GT albedo
             "normal_gt_dir": "normal_gt",      # WORLD-space GT normal
-            "metallic_gt_dir": "",
+            "metallic_gt_dir": "metallic_simulated_zero",
             "roughness_gt_dir": "",
             "eval_relight_hdris": LEGO_DIR_RELIGHT_HDRs,
             "envmap_gt_path": os.path.join(LEGO_DIR, "hdris", "sunset.hdr"),
@@ -244,67 +250,99 @@ DATASETS = [
 # to the global brightness / colour shift between Cycles and the GIR BRDF.
 ALBEDO_VARIANTS = [
     {
-        # GIR baseline: priors computed for logging only (NOT optimized), full TV
-        # losses, envmap regularizer at its paper value, no prior scheduler.
+        # baseline
         "name": "baseline_no_prior",
         "args": {"reg_hdr_weight": 0.001, "tv_reduction_factor": 1.0},
         "flags": {"exclude_prior_loss": True},
     },
-    #{
-    #    # (1) Spatial-gradient / edge loss: match the rendered albedo gradient to
-    #    # the GT albedo gradient (L1). Ignores any global brightness/colour shift
-    #    # and only forces texture boundaries / edges into the right places.
-    #    "name": "albedo_gradient",
-    #    "args": {"albedo_prior_mode": "gradient", "tv_reduction_factor": 0.75},
-    #    "flags": {"use_prior_weight_scheduler": True},
-    #},
     {
-        # (2) Scale-and-shift-invariant loss (ZNCC / Pearson): standardise both
-        # albedos per channel (mean 0, std 1) before comparing, so the GIR albedo
-        # may be proportionally brighter / darker / different contrast.
-        "name": "albedo_zncc",
-        "args": {"albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.001},
-        "flags": {"use_prior_weight_scheduler": True},
+        # photometric warmup zncc
+        "name": "photometric_warmup_zncc",
+        "args": {
+            "albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
+        },
+        "flags": {
+            "use_prior_weight_scheduler": True,
+            #"albedo_geometry_warmup": True,
+            #"disable_reset_third_stage": True,
+        },
     },
     {
-        # (2) Scale-and-shift-invariant loss (ZNCC / Pearson): standardise both
-        # albedos per channel (mean 0, std 1) before comparing, so the GIR albedo
-        # may be proportionally brighter / darker / different contrast.
-        "name": "albedo_zncc_reg_hdr",
-        "args": {"albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.001},
-        "flags": {"use_prior_weight_scheduler": True},
+        # albedo warmup zncc
+        "name": "albedo_warmup_zncc",
+        "args": {
+            "albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
+        },
+        "flags": {
+            "use_prior_weight_scheduler": True,
+            "albedo_geometry_warmup": True,
+            #"disable_reset_third_stage": True,
+        },
+    },
+    {
+        # photometric warmup direct
+        "name": "photometric_warmup_direct",
+        "args": {
+            "albedo_prior_mode": "direct", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
+        },
+        "flags": {
+            "use_prior_weight_scheduler": True,
+            #"albedo_geometry_warmup": True,
+            #"disable_reset_third_stage": True,
+        },
+    },
+    {
+        # diffusion albedo warmup zncc
+        "name": "diffusion_zncc",
+        "args": {
+            "albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
+            "albedo_gt_dir": "albedo", 
+            "normal_gt_dir": "normal",
+            "metallic_gt_dir": "metallic_video",
+            "roughness_gt_dir": "roughness_video",
+            "normal_camera_convention": "opengl",
+            "lambda_metallic_gt": 0.05,
+        },
+        "flags": {
+            "use_prior_weight_scheduler": True,
+            "albedo_geometry_warmup": True,
+            #"disable_reset_third_stage": True,
+        },
     },
     #{
-    #    # (3) Structure-focused SSIM: SSIM on the albedo with the luminance term
-    #    # heavily down-weighted, so shapes / textures must match the GT but the
-    #    # overall brightness / contrast may drift.
-    #    "name": "albedo_ssim_struct",
-    #    "args": {"albedo_prior_mode": "ssim_struct", "tv_reduction_factor": 0.75},
-    #    "flags": {"use_prior_weight_scheduler": True},
-    #},
-    #{
-    #    # (4) Locally-normalised cross-correlation (relight-focused refinement of
-    #    # zncc): standardise both albedos inside a sliding Gaussian window so the
-    #    # loss is invariant to SPATIALLY-VARYING gain. Removes smooth baked
-    #    # shading the global zncc leaves behind, keeping illumination out of the
-    #    # recovered albedo for cleaner relighting.
-    #    "name": "albedo_zncc_local",
-    #    "args": {"albedo_prior_mode": "zncc_local", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0007},
-    #    "flags": {"use_prior_weight_scheduler": True},
+    #    # diffusion albedo warmup zncc grad
+    #    "name": "diffusion_zncc_grad",
+    #    "args": {
+    #        "albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
+    #        "albedo_gt_dir": "albedo", 
+    #        "normal_gt_dir": "normal",
+    #        "metallic_gt_dir": "metallic_video",
+    #        "roughness_gt_dir": "roughness_video",
+    #        "normal_camera_convention": "opengl",
+    #        "lambda_metallic_gt": 0.05,
+    #    },
+    #    "flags": {
+    #        "use_prior_weight_scheduler": True,
+    #        "albedo_geometry_warmup": True,
+    #        #"disable_reset_third_stage": True,
+    #    },
     #},
     {
-        # (5) Gradient-domain ZNCC (relight-focused refinement of zncc): match
-        # the scale-&-shift-invariant correlation of the albedo SPATIAL GRADIENTS
-        # so low-frequency baked shading is differentiated away and only
-        # high-frequency texture edges are supervised.
-        "name": "albedo_zncc_grad",
-        "args": {"albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0007},
-        "flags": {"use_prior_weight_scheduler": True},
+        # albedo warmup zncc
+        "name": "albedo_warmup_zncc_grad",
+        "args": {
+            "albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
+        },
+        "flags": {
+            "use_prior_weight_scheduler": True,
+            "albedo_geometry_warmup": True,
+            #"disable_reset_third_stage": True,
+        },
     },
 ]
 
 # Where all run folders for this batch live.
-EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_1")
+EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_4_presentation")
 
 # Build the 8 experiments = every albedo variant on every dataset. Each
 # experiment merges dataset args first, then the variant args (variant wins).
@@ -320,6 +358,137 @@ for _dataset in DATASETS:
         })
 
 # =============================================================================
+# STAGE-1/2 WARM-UP BUFFER  -- reuse the geometry + normal-alignment stages
+# =============================================================================
+# Phases 1 (geometry warm-up) and 2 (normal alignment) — everything at
+# iter <= second_stage_step — depend only on a subset of the configuration.
+# Any two runs that agree on ALL of those parameters produce an identical
+# stage-2 checkpoint, so we can compute it ONCE, stash the checkpoint in a
+# shared buffer keyed by a fingerprint of those parameters, and let every later
+# run that matches resume straight into Phase 3 (full PBR) via train.py's
+# `--start_checkpoint`.
+#
+# Buffer layout:
+#   outputs/warmup_buffer/<fingerprint-hash>/
+#       metadata.json              # the fingerprint + provenance (human-readable)
+#       chkpnt<second_stage_step>.pth
+WARMUP_BUFFER_ROOT = os.path.join(REPO_DIR, "outputs", "warmup_buffer")
+
+# Parameters that influence the geometry warm-up + normal-alignment stages.
+# (Stage-3-only knobs — reg_*_weight, the prior-weight scheduler, geo-LR
+# reduction, the third-stage reset toggle, metallic/roughness priors, eval /
+# relight / logging settings — are deliberately EXCLUDED so runs that differ
+# only in Phase 3 share the same warm-up.)
+WARMUP_FINGERPRINT_KEYS = [
+    # scene / data
+    "source_path", "resolution", "white_background", "random_background",
+    "normal_gt_dir", "normal_camera_convention",
+    # stage boundaries / total length
+    "first_stage_step", "second_stage_step", "iterations",
+    # densification (runs throughout stages 1 & 2)
+    "percent_dense", "densification_interval", "opacity_reset_interval",
+    "densify_from_iter", "densify_until_iter", "densify_grad_threshold",
+    "max_gaussians",
+    # losses active in stages 1 & 2
+    "lambda_dssim", "lambda_normal_gt", "tv_reduction_factor",
+]
+# Boolean store_true flags that influence stages 1 & 2.
+WARMUP_FINGERPRINT_FLAG_KEYS = [
+    "white_background", "random_background",
+    "exclude_prior_loss", "albedo_geometry_warmup",
+]
+
+
+def _full_config(exp):
+    """Merge COMMON + the experiment's args + flags into one flat dict.
+
+    Mirrors the precedence used by build_command (dataset/variant args win over
+    COMMON, flags add the booleans), so the fingerprint sees exactly the values
+    that train.py will receive.
+    """
+    cfg = dict(COMMON)
+    cfg.update(exp.get("args", {}))
+    cfg.update(exp.get("flags", {}))
+    return cfg
+
+
+def warmup_fingerprint(exp):
+    """Build the ordered dict of stage-1/2-influencing parameters for `exp`."""
+    cfg = _full_config(exp)
+    fp = {}
+    for k in WARMUP_FINGERPRINT_KEYS:
+        fp[k] = cfg.get(k, None)
+    for k in WARMUP_FINGERPRINT_FLAG_KEYS:
+        fp[k] = bool(cfg.get(k, False))
+    # The albedo prior only takes part in the warm-up stages when albedo
+    # geometry warm-up is enabled; otherwise its settings are irrelevant here
+    # (the albedo prior is a Phase-3-only loss), so we leave them out to keep
+    # the buffer shared across albedo-only variations.
+    if fp.get("albedo_geometry_warmup"):
+        fp["albedo_gt_dir"] = cfg.get("albedo_gt_dir", "")
+        fp["lambda_albedo_gt"] = cfg.get("lambda_albedo_gt", None)
+        fp["huber_delta"] = cfg.get("huber_delta", None)
+        # Stages 1 & 2 use warmup_albedo_prior_mode, falling back to
+        # albedo_prior_mode when empty (same rule as train.py).
+        fp["warmup_albedo_prior_mode"] = (
+            cfg.get("warmup_albedo_prior_mode", "") or cfg.get("albedo_prior_mode", "")
+        )
+    return fp
+
+
+def _fingerprint_hash(fingerprint):
+    blob = json.dumps(fingerprint, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _second_stage_step(exp):
+    return int(_full_config(exp).get("second_stage_step"))
+
+
+def find_buffered_checkpoint(exp):
+    """Return the path to a buffered stage-2 checkpoint matching `exp`, or None."""
+    fp = warmup_fingerprint(exp)
+    sss = _second_stage_step(exp)
+    entry_dir = os.path.join(WARMUP_BUFFER_ROOT, _fingerprint_hash(fp))
+    meta_path = os.path.join(entry_dir, "metadata.json")
+    ckpt_path = os.path.join(entry_dir, f"chkpnt{sss}.pth")
+    if not (os.path.exists(meta_path) and os.path.exists(ckpt_path)):
+        return None
+    # Guard against the (unlikely) hash collision: confirm an exact match.
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    except Exception:
+        return None
+    if meta.get("fingerprint") == fp:
+        return ckpt_path
+    return None
+
+
+def save_to_buffer(exp, model_path):
+    """Copy the freshly-computed stage-2 checkpoint of `exp` into the buffer."""
+    fp = warmup_fingerprint(exp)
+    sss = _second_stage_step(exp)
+    src = os.path.join(model_path, f"chkpnt{sss}.pth")
+    if not os.path.exists(src):
+        print(f"[buffer] WARNING: expected stage-2 checkpoint '{src}' not found; "
+              f"nothing buffered for '{exp['name']}'.", flush=True)
+        return
+    entry_dir = os.path.join(WARMUP_BUFFER_ROOT, _fingerprint_hash(fp))
+    os.makedirs(entry_dir, exist_ok=True)
+    dst = os.path.join(entry_dir, f"chkpnt{sss}.pth")
+    shutil.copy2(src, dst)
+    with open(os.path.join(entry_dir, "metadata.json"), "w") as f:
+        json.dump({
+            "fingerprint": fp,
+            "second_stage_step": sss,
+            "source_run": os.path.basename(model_path),
+            "saved": datetime.now().isoformat(timespec="seconds"),
+        }, f, indent=2)
+    print(f"[buffer] Buffered stage-2 checkpoint -> {dst}", flush=True)
+
+
+# =============================================================================
 # RUN LAUNCHING
 # =============================================================================
 
@@ -330,16 +499,32 @@ def _fmt_value(v):
     return [str(v)]
 
 
-def build_command(exp, model_path):
-    """Build the `python train.py ...` command for one experiment."""
+def build_command(exp, model_path, start_checkpoint=None, ensure_checkpoint_iter=None):
+    """Build the `python train.py ...` command for one experiment.
+
+    start_checkpoint        : if given, resume from this checkpoint (stage-2
+                              buffer) so only Phase 3 is computed.
+    ensure_checkpoint_iter  : if given, make sure this iteration is in
+                              checkpoint_iterations so the stage-2 checkpoint is
+                              written (and can later be copied into the buffer).
+    """
     cfg = dict(COMMON)
     cfg.update(exp.get("args", {}))
+
+    # Guarantee a checkpoint is written at the stage-2 boundary so it can be
+    # buffered afterwards (only relevant for runs that actually compute it).
+    if ensure_checkpoint_iter is not None:
+        ckpt_iters = list(cfg.get("checkpoint_iterations", []))
+        if ensure_checkpoint_iter not in ckpt_iters:
+            ckpt_iters.append(ensure_checkpoint_iter)
+            ckpt_iters.sort()
+        cfg["checkpoint_iterations"] = ckpt_iters
 
     # Boolean store_true flags handled separately (engine + run via train.py).
     bool_flags = {
         "eval", "white_background", "exclude_prior_loss", "use_prior_weight_scheduler",
         "remove_noise", "hdr_rotation", "random_background", "quiet",
-        "disable_reset_third_stage",
+        "disable_reset_third_stage", "albedo_geometry_warmup",
     }
 
     flags = dict(exp.get("flags", {}))
@@ -352,11 +537,20 @@ def build_command(exp, model_path):
     cmd += ["--source_path", cfg.pop("source_path")]
     cmd += ["--model_path", model_path]
 
+    if start_checkpoint:
+        # train.py loads this via torch.load and resumes from the stored
+        # iteration (== second_stage_step), so only Phase 3 runs.
+        cmd += ["--start_checkpoint", start_checkpoint]
+
     for key, value in cfg.items():
         # An empty list (e.g. eval_relight_hdris=[] for real-world data) would
         # produce a "--flag" with no values, which argparse nargs="+" rejects.
         # Skip it so the engine falls back to its default / no-op behaviour.
         if isinstance(value, (list, tuple)) and len(value) == 0:
+            continue
+        # An empty string scalar (e.g. warmup_albedo_prior_mode="") likewise
+        # just means "use the engine default", so skip it too.
+        if isinstance(value, str) and value == "":
             continue
         cmd.append(f"--{key}")
         cmd += _fmt_value(value)
@@ -368,12 +562,31 @@ def build_command(exp, model_path):
     return cmd
 
 
-def run_experiment(exp):
-    """Launch a single experiment as a subprocess. Returns the model_path."""
+def run_experiment(exp, use_buffer=True):
+    """Launch a single experiment as a subprocess. Returns (model_path, rc).
+
+    When `use_buffer` is on we first look for a buffered stage-2 checkpoint
+    whose fingerprint matches this run's Phase-1/2 configuration:
+      * HIT  -> resume from it (Phase 3 only).
+      * MISS -> run all three phases, then copy the stage-2 checkpoint into the
+                buffer for future runs.
+    """
     model_path = os.path.join(EXPERIMENT_ROOT, exp["name"])
     os.makedirs(model_path, exist_ok=True)
 
-    cmd = build_command(exp, model_path)
+    buffered_ckpt = find_buffered_checkpoint(exp) if use_buffer else None
+    sss = _second_stage_step(exp)
+    if buffered_ckpt:
+        print(f"[buffer] HIT for '{exp['name']}': reusing stage-2 checkpoint "
+              f"{buffered_ckpt} (running Phase 3 only).", flush=True)
+        cmd = build_command(exp, model_path, start_checkpoint=buffered_ckpt)
+    else:
+        if use_buffer:
+            print(f"[buffer] MISS for '{exp['name']}': computing all three phases "
+                  f"(stage-2 checkpoint will be buffered at iter {sss}).", flush=True)
+        cmd = build_command(exp, model_path,
+                            ensure_checkpoint_iter=(sss if use_buffer else None))
+
     print("\n" + "=" * 78)
     print(f"RUN: {exp['name']}")
     print("  " + " ".join(shlex.quote(c) for c in cmd))
@@ -401,6 +614,9 @@ def run_experiment(exp):
     if returncode != 0:
         print(f"\n[ERROR] Run '{exp['name']}' exited with code {returncode}. "
               f"See {log_path}", flush=True)
+    elif use_buffer and not buffered_ckpt:
+        # Fresh full run succeeded: stash its stage-2 checkpoint for reuse.
+        save_to_buffer(exp, model_path)
     return model_path, returncode
 
 
@@ -670,6 +886,9 @@ def main():
                     help="Skip training; only (re)build the comparison report.")
     ap.add_argument("--only", nargs="+", default=None,
                     help="Run only the named experiments (default: all).")
+    ap.add_argument("--no-buffer", action="store_true",
+                    help="Disable the stage-1/2 warm-up buffer (always compute "
+                         "all three phases and never read/write the buffer).")
     args = ap.parse_args()
 
     selected = EXPERIMENTS
@@ -687,7 +906,7 @@ def main():
     else:
         os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
         for e in selected:
-            model_path, rc = run_experiment(e)
+            model_path, rc = run_experiment(e, use_buffer=not args.no_buffer)
             runs.append((e["name"], model_path))
 
     generate_comparison(runs, EXPERIMENT_ROOT)

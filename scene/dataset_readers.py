@@ -23,6 +23,11 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 
+# Sentinel value for a *_gt_dir: instead of loading prior images from disk, use a
+# constant 0 for every pixel (e.g. metallic_gt_dir="metallic_simulated_zero"
+# means the scene contains no metallic objects, so the metallic GT is all zeros).
+METALLIC_SIMULATED_ZERO = "metallic_simulated_zero"
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -261,7 +266,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
                 albedo_gt_img = _load_prior(albedo_dir, "albedo")
                 normal_gt_img = _load_prior(normal_dir, "normal")
-                metallic_gt = _load_prior(metallic_dir, "metallic")
+                if metallic_dir == METALLIC_SIMULATED_ZERO:
+                    metallic_gt = 0.0  # no metallic objects: all-zero GT (no disk load)
+                else:
+                    metallic_gt = _load_prior(metallic_dir, "metallic")
                 roughness_gt = _load_prior(roughness_dir, "roughness")
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
@@ -505,7 +513,10 @@ def readColmapWithPriorsInfo(path, eval, llffhold=8,
 
         albedo_gt_img = _load_prior(albedo_dir, "albedo", idx)
         normal_gt_img = _load_prior(normal_dir, "normal", idx)
-        metallic_gt = _load_prior(metallic_dir, "metallic", idx)
+        if metallic_dir == METALLIC_SIMULATED_ZERO:
+            metallic_gt = 0.0  # no metallic objects: all-zero GT (no disk load)
+        else:
+            metallic_gt = _load_prior(metallic_dir, "metallic", idx)
         roughness_gt = _load_prior(roughness_dir, "roughness", idx)
 
         cam_infos.append(CameraInfo(

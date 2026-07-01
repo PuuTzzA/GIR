@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import RGB2SH
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, random_bg_color = None, iteration=None, scaling_modifier = 1.0, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, random_bg_color = None, iteration=None, scaling_modifier = 1.0, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, albedo_geometry_warmup=False):
     """
     Render the scene. 
     
@@ -90,13 +90,27 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     diffuse_color = None
     specular_indirect_light = None
     specular_indirect_color = None
-    if iteration <= first_stage_step:
+    # In albedo geometry-warmup mode the flat per-gaussian albedo is rendered
+    # (and supervised against the GT albedo prior) through BOTH the geometry and
+    # the normal-alignment stages, i.e. for every iteration up to
+    # second_stage_step, rather than only the first stage. The warmed-up albedo
+    # is then carried into the PBR stage (its boundary reset is skipped below).
+    use_flat_albedo = (iteration <= first_stage_step) or (albedo_geometry_warmup and iteration <= second_stage_step)
+    if use_flat_albedo:
         colors_precomp = pc.get_albedo_init
-        if iteration == first_stage_step:
+        albedo = pc.get_albedo_init  # alias so the Phase-2 viz/logging path works
+        # Original GIR zeroes the warm-up albedo at the first-stage boundary so
+        # the PBR albedo starts fresh; in warm-up mode we keep it. Boundary
+        # resets are a training-time state transition, so only fire on is_train.
+        if iteration == first_stage_step and is_train and not albedo_geometry_warmup:
             pc._albedo_init.data = torch.zeros_like(pc._albedo_init)
     else:
-        if iteration == second_stage_step+1:
-            pc._albedo_init.data = torch.zeros_like(pc._albedo_init)
+        if iteration == second_stage_step+1 and is_train:
+            # Enter the PBR stage: reset the radiance features and randomise the
+            # material channels. In warm-up mode keep the albedo learned during
+            # the warm-up (do NOT zero _albedo_init).
+            if not albedo_geometry_warmup:
+                pc._albedo_init.data = torch.zeros_like(pc._albedo_init)
             pc._features_dc.data = torch.zeros_like(pc._features_dc)
             pc._features_rest.data = torch.zeros_like(pc._features_rest)
             pc._metallic_init.data = torch.rand_like(pc._metallic_init) * 0.2

@@ -145,7 +145,7 @@ def gt_normal_world(viewpoint, gt_normal):
         R_cam2world=getattr(viewpoint, "R_cam2world", None),
         convention=getattr(viewpoint, "normal_camera_convention", "opengl"))
 
-def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False, run_relighting_eval=False, eval_relight_hdris=[], envmap_gt_path=""):
+def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_stage_step, second_stage_step, remove_noise, hdr_rotation, ema_loss, lpips_model, save_visuals=False, run_relighting_eval=False, eval_relight_hdris=[], envmap_gt_path="", albedo_geometry_warmup=False):
     """Evaluate metrics on test and train cameras at the current iteration."""
     torch.cuda.empty_cache()
     lpips_model.to("cuda")
@@ -174,7 +174,8 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                                 first_stage_step=first_stage_step,
                                 second_stage_step=second_stage_step,
                                 remove_noise=remove_noise,
-                                hdr_rotation=hdr_rotation)
+                                hdr_rotation=hdr_rotation,
+                                albedo_geometry_warmup=albedo_geometry_warmup)
             image = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
             gt_image, _ = get_mask(gt_image)
@@ -342,7 +343,8 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                                                     first_stage_step=first_stage_step,
                                                     second_stage_step=second_stage_step,
                                                     remove_noise=remove_noise,
-                                                    hdr_rotation=hdr_rotation)
+                                                    hdr_rotation=hdr_rotation,
+                                                    albedo_geometry_warmup=albedo_geometry_warmup)
                                 image = torch.clamp(render_pkg["render"], 0.0, 1.0)
 
                                 relight_psnr_vals.append(psnr(image, gt_relight).mean().item())
@@ -411,7 +413,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=False, prior_weight_scheduler_ratio=0.15, prior_weight_final_ratio=1.0, albedo_prior_mode="direct", huber_delta=0.1, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace'], envmap_gt_path="", tv_reduction_factor=1.0, reduce_geo_lr_third_stage=1.0, geo_lr_final_iter=0, disable_reset_third_stage=False):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=False, prior_weight_scheduler_ratio=0.15, prior_weight_final_ratio=1.0, albedo_prior_mode="direct", huber_delta=0.1, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace'], envmap_gt_path="", tv_reduction_factor=1.0, reduce_geo_lr_third_stage=1.0, geo_lr_final_iter=0, disable_reset_third_stage=False, albedo_geometry_warmup=False, warmup_albedo_prior_mode=""):
     # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
     # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
     user_eval_set = (eval_interval != 2000)
@@ -516,7 +518,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(viewpoint_cam, gaussians, pipe, background, random_bg_color=bg, iteration=iteration, is_train=True, first_stage_step=first_stage_step, second_stage_step=second_stage_step, remove_noise=remove_noise, hdr_rotation=hdr_rotation)["render"]
+                    net_image = render(viewpoint_cam, gaussians, pipe, background, random_bg_color=bg, iteration=iteration, is_train=True, first_stage_step=first_stage_step, second_stage_step=second_stage_step, remove_noise=remove_noise, hdr_rotation=hdr_rotation, albedo_geometry_warmup=albedo_geometry_warmup)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -546,7 +548,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, random_bg_color=bg, iteration=iteration, is_train=True, first_stage_step=first_stage_step, second_stage_step=second_stage_step, remove_noise=remove_noise, hdr_rotation=hdr_rotation)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, random_bg_color=bg, iteration=iteration, is_train=True, first_stage_step=first_stage_step, second_stage_step=second_stage_step, remove_noise=remove_noise, hdr_rotation=hdr_rotation, albedo_geometry_warmup=albedo_geometry_warmup)
         image = render_pkg["render"]
         depth = render_pkg["depth"]
         alpha = render_pkg["alpha"]
@@ -581,6 +583,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss_image = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss = loss_image
+        # ── Albedo geometry warm-up (Phases 1 & 2) ──────────────────
+        # PBR albedo is view-independent, so during the geometry / normal-
+        # alignment stages we fit geometry to the GT albedo prior directly
+        # instead of to the RGB images via the photometric loss. The rendered
+        # `image` here IS the flat per-gaussian albedo (see the renderer's
+        # warm-up path); the photometric / PBR loss is withheld until the PBR
+        # stage (iter > second_stage_step). The Phase-2 normal prior below still
+        # adds on top of this.
+        if albedo_geometry_warmup and not exclude_prior_loss and iteration <= second_stage_step:
+            gt_albedo_warmup = getattr(viewpoint_cam, 'albedo_gt', None)
+            if gt_albedo_warmup is not None:
+                # The warm-up (stages 1 & 2) may use a DIFFERENT albedo prior
+                # formulation than the PBR stage (stage 3): `warmup_albedo_prior_mode`
+                # selects it, falling back to `albedo_prior_mode` when left empty.
+                warmup_mode = warmup_albedo_prior_mode or albedo_prior_mode
+                # Composite the GT albedo over the same background as the
+                # rendered image so empty pixels match exactly and do not skew
+                # the (scale-sensitive) albedo prior.
+                gt_albedo_warmup = gt_albedo_warmup * gt_mask + bg.unsqueeze(-1).unsqueeze(-1).repeat(1, gt_albedo_warmup.shape[1], gt_albedo_warmup.shape[2]) * (1 - gt_mask)
+                loss = lambda_albedo_gt * albedo_prior_loss(image, gt_albedo_warmup,
+                                                            mode=warmup_mode,
+                                                            lambda_dssim=opt.lambda_dssim,
+                                                            delta=huber_delta)
+                loss_albedo_gt_val = l1_loss(image, gt_albedo_warmup).detach()
         if iteration > second_stage_step:
             multiplier = 1.0
             if use_prior_weight_scheduler:
@@ -893,7 +919,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ema_loss_for_log, lpips_model, save_visuals=save_visuals,
                     run_relighting_eval=run_relighting_eval,
                     eval_relight_hdris=eval_relight_hdris,
-                    envmap_gt_path=envmap_gt_path
+                    envmap_gt_path=envmap_gt_path,
+                    albedo_geometry_warmup=albedo_geometry_warmup
                 )
                 metrics_log.append(eval_results)
                 with open(metrics_log_path, "w") as f:
@@ -1001,7 +1028,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_prior_weight_scheduler", action="store_true", default=False, help="Ramp prior/envmap-reg weights up then partially back down (off = constant weights)")
     parser.add_argument("--prior_weight_scheduler_ratio", type=float, default=0.15, help="Warm-up ratio (fraction of PBR-stage steps spent ramping 0->1)")
     parser.add_argument("--prior_weight_final_ratio", type=float, default=1.0, help="Value the prior/envmap weight schedule ramps to after warm-up (fraction of max weight). 1.0 = hold at full strength, >1 = increase, <1 = decay toward a floor (e.g. 0.5 = old behavior)")
-    parser.add_argument("--albedo_prior_mode", type=str, default="direct", choices=["direct", "lstsq", "log_chroma", "gradient", "zncc", "zncc_local", "zncc_grad", "ssim_struct"], help="Albedo prior formulation: direct | lstsq (per-channel gain align) | log_chroma (log+chromaticity) | gradient (spatial-gradient/edge) | zncc (scale-&-shift-invariant) | zncc_local (locally-normalised correlation) | zncc_grad (gradient-domain correlation) | ssim_struct (structure-focused SSIM)")
+    parser.add_argument("--albedo_prior_mode", type=str, default="direct", choices=["direct", "lstsq", "log_chroma", "gradient", "zncc", "zncc_local", "zncc_grad", "ssim_struct"], help="Albedo prior formulation (PBR stage 3): direct | lstsq (per-channel gain align) | log_chroma (log+chromaticity) | gradient (spatial-gradient/edge) | zncc (scale-&-shift-invariant) | zncc_local (locally-normalised correlation) | zncc_grad (gradient-domain correlation) | ssim_struct (structure-focused SSIM)")
+    parser.add_argument("--warmup_albedo_prior_mode", type=str, default="", choices=["", "direct", "lstsq", "log_chroma", "gradient", "zncc", "zncc_local", "zncc_grad", "ssim_struct"], help="Albedo prior formulation used during the geometry/normal WARM-UP stages (1 & 2) when --albedo_geometry_warmup is set. Empty = use the same mode as --albedo_prior_mode. Lets you e.g. warm up with 'direct' and decompose with 'zncc' in stage 3.")
     parser.add_argument("--huber_delta", type=float, default=0.1, help="Delta for the robust Huber prior losses")
     parser.add_argument("--exclude_prior_loss", action="store_true", default=False, help="Exclude GT priors loss from optimization, but keep calculating it for debug/logging purposes")
     parser.add_argument("--eval_relight_hdris", nargs="+", type=str, default=['snowy_forest', 'moonless_night', 'fireplace'], help="List of HDRI names to evaluate relighting on")
@@ -1010,6 +1038,7 @@ if __name__ == "__main__":
     parser.add_argument("--reduce_geo_lr_third_stage", type=float, default=1.0, help="Final multiplier on geometry LRs (xyz/scaling/rotation), cosine-annealed across the third stage. 1.0 = off (no change), e.g. 0.05 = reduce to 5%%")
     parser.add_argument("--geo_lr_final_iter", type=int, default=0, help="Iteration at which reduce_geo_lr_third_stage is fully reached (<=0 means end of training)")
     parser.add_argument("--disable_reset_third_stage", action="store_true", default=False, help="Skip opacity resets once iteration > second_stage_step (third / PBR stage)")
+    parser.add_argument("--albedo_geometry_warmup", action="store_true", default=False, help="Supervise the flat rendered albedo against the GT albedo prior during the geometry/normal stages (iter <= second_stage_step) instead of the RGB photometric loss; the photometric/PBR loss is reintroduced only in the PBR stage. The warmed-up albedo is carried over (not reset) into the PBR stage. Combine with reduce_geo_lr_third_stage to freeze geometry once PBR begins.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -1032,7 +1061,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.prior_weight_final_ratio, args.albedo_prior_mode, args.huber_delta, args.exclude_prior_loss, args.eval_relight_hdris, args.envmap_gt_path, args.tv_reduction_factor, args.reduce_geo_lr_third_stage, args.geo_lr_final_iter, args.disable_reset_third_stage)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.prior_weight_final_ratio, args.albedo_prior_mode, args.huber_delta, args.exclude_prior_loss, args.eval_relight_hdris, args.envmap_gt_path, args.tv_reduction_factor, args.reduce_geo_lr_third_stage, args.geo_lr_final_iter, args.disable_reset_third_stage, args.albedo_geometry_warmup, args.warmup_albedo_prior_mode)
 
     # All done
     print("\nTraining complete.")
