@@ -108,7 +108,7 @@ REPO_DIR = os.path.dirname(GIR_DIR)
 LEGO_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "lego")
 REAL_LIFE_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "bicycle")
 
-LEGO_DIR_RELIGHT_HDRs = ["fireplace", "night", "snow", "city", "courtyard"]  # HDRIs for blender datasets (lego, armadillo)
+LEGO_DIR_RELIGHT_HDRs = ["fireplace", "night", "snow", "city", "courtyard", "forest"]  # HDRIs for blender datasets (lego, armadillo)
 REAL_LIFE_DIR_RELIGHT_HDRs = []                          # real photos: no relight GT, so empty
 
 COMMON = {
