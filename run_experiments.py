@@ -45,25 +45,56 @@ schedule (priors are introduced gradually, geometry first):
         smoothness is unnecessary / harmful).
 
 ------------------------------------------------------------------------------
-THE FOUR RUNS (lego, resolution 2, 60k iterations)
+THE RUNS (lego, resolution 4, 37.5k iterations) — try_8: LLI ENV-MEAN DETACHED
 ------------------------------------------------------------------------------
-This batch keeps the priors SMALL (only albedo + normal GT; metallic / roughness
-priors stay OFF) and isolates the albedo prior formulation. The normal GT prior
-is handled exactly as before (cosine loss).
+try_7 findings this batch is built on:
+  * anchor+LLI IS the new best decomposition: aligned relight 27.97 dB
+    (ctrl 26.95), albedo PSNR 27.3 (zncc: 31.2!), normals level with ctrl.
+  * BUT the LLI bounce term (reflectance x env_mean) opened a DEGENERACY:
+    the bounce gradient flows into the envmap MEAN, so the optimizer pumped
+    a few tiny ultra-bright texels (env mean 3.3x the GT sunset) while the
+    rest of the map went dark — the sunset core vanished from the learned
+    HDR (log-corr 0.69 -> 0.28, envmap logPSNR 30.3 -> 26.1). Because the
+    bounce was calibrated against that inflated mean, it under-scales when a
+    native-intensity HDRI is swapped in: relight gain stalled at 1.32-1.40
+    instead of -> 1.0. ENGINE FIX (this batch): env_mean is now DETACHED, so
+    the envmap only receives gradients through the direct light terms and the
+    SH reflectance alone calibrates the bounce.
+  * Gain metric sanity (answers "shouldn't it be 1?"): under the TRAINING
+    light the fitted gain is ~1.09 (the photometric loss pins it); the >1.25
+    values in the charts are RELIGHT gains under unseen HDRIs — their gap to
+    the train-light gain IS the remaining energy deficit, not a metric bug.
+    New metrics this batch: test_gain (train-light reference) and
+    envmap_mean_ratio (learned-envmap brightness / GT; try_7 showed it tracks
+    the relight gain).
+  * reg_hdr hypothesis is DEAD: plus_hdrfix (reg_hdr 0.001) ~= t6 plus
+    (reg_hdr 0.01) in every metric (delta <= 0.15 dB). The _plus bundle's
+    remaining deficit vs anchor_lli comes from its other pieces (no LLI,
+    roughness_video prior, prior_geom_grad_scale 0), so the bundle is retired.
+  * anchor-only / lli-only / diffusion arms OOMed on the 8 GB machine
+    (~1.2M gaussians need more VRAM) — anchor-only and diffusion re-run here.
 
-    1. baseline_no_prior : GIR baseline. Priors computed for logging only
-                           (NOT optimized), full TV losses, envmap regularizer
-                           ON, no prior scheduler.
-    2. albedo_gradient   : NEW gradient-domain albedo prior. Matches the spatial
-                           gradient of the rendered albedo to the gradient of the
-                           GT albedo, so flat GT regions push the rendered albedo
-                           gradient to zero (and GT edges are reproduced).
-    3. albedo_direct     : "direct" albedo loss (Huber + DSSIM on raw values).
-    4. albedo_log_chroma : log-intensity + chromaticity (intrinsic-image) albedo
-                           loss.
+    1. gt_zncc_grad_anchor      : anchor 0.05, NO LLI (re-run of the OOMed
+                                  diagnostic). Gives the no-LLI relight-gain /
+                                  envmap_mean_ratio reference and cleanly
+                                  attributes LLI's contribution (plus_hdrfix
+                                  is confounded by roughness+grad_scale).
+    2. gt_zncc_grad_anchor_lli2 : anchor + FIXED LLI (detached env_mean).
+                                  Prediction: envmap log-corr/logPSNR recover
+                                  toward ctrl (~30), sunset core visible,
+                                  relight gain drops below try_7's 1.32.
+    3. gt_zncc_anchor_lli2      : zncc twin — best albedo in try_7 (31.2 dB);
+                                  if its relight catches up with the fixed
+                                  bounce it becomes the headline config.
+    4. diff_zncc_grad_lli2      : diffusion priors + fixed LLI, NO anchor
+                                  (diffusion albedo scale unreliable) —
+                                  keeps the diffusion thread alive.
 
-   The per-channel least-squares albedo mode ("lstsq") is kept in the engine but
-   dropped from this batch.
+Eval cost: relight_max_views=24 caps the relight eval at 24 of 200 test views
+(deterministic, evenly spaced -> ~8x faster relight evals; expect ±0.1-0.2 dB
+sampling difference vs the 200-view numbers of try_6/7). Baseline + try_6/7
+references are pulled into the report via EXTERNAL_RUNS below, NOT re-run.
+All 4 runs resume from the stage-2 warm-up buffer (~1/3 run cost).
 
 ------------------------------------------------------------------------------
 USAGE
@@ -113,39 +144,46 @@ REAL_LIFE_DIR_RELIGHT_HDRs = []                          # real photos: no relig
 
 COMMON = {
     "eval": True,                 # hold out the test cameras for novel-view eval
-    "random_background": False,   # default: False
+    # Reference launch scripts train with --random_background; it also prevents
+    # background-colour baking, so every run uses it.
+    "random_background": True,
 
-    "iterations": 60_000,          # total iterations (good-GPU run)
+    # Blender-rendered data is Z-up while the envlight lat-long convention is
+    # Y-up: the reference trains Blender/TensoIR scenes with --hdr_rotation.
+    # Without it every relight eval samples the loaded HDRI sideways (verified:
+    # the learned envmap matches the GT sunset only under GIR's rotation map,
+    # log-corr +0.40 vs -0.21 for identity). REQUIRED on our lego dataset.
+    "hdr_rotation": True,
+
+    "iterations": 37_500,          # total iterations (good-GPU run)
 
     # ── 3-phase schedule ────────────────────────────────────────────────
-    #   Phase 1 GEOMETRY        : iter 0    .. 2000   (radiance warm-up)
-    #   Phase 2 NORMAL ALIGN    : iter 2000 .. 5000   (GT normal prior only)
-    #   Phase 3 FULL PBR        : iter 5000 .. 12000  (all priors + materials)
     "first_stage_step": 5_000,      # end of Phase 1 (radiance warm-up)
-    "second_stage_step": 30_000,     # end of Phase 2 / start of Phase 3 (PBR)
+    "second_stage_step": 25_000,    # end of Phase 2 / start of Phase 3 (PBR)
 
-    # Densification / pruning. densify_until_iter (7000) < iterations (12000),
-    # and opacity_reset_interval (3000) only fires at 3000 & 6000 (both inside
-    # the densify window), so the last 5000 iters settle cleanly with no
-    # densification / opacity reset disturbing the final result.
+    # Densification / pruning. densify_until_iter (30k) < iterations (40k) and
+    # opacity resets stop with densification, so the final 10k iterations
+    # settle cleanly — in try_5 densify_until (45k) exceeded the run length and
+    # opacity resets fired up to iter 39k, depressing every final metric.
     "percent_dense": 0.01,           # default: 0.01
     "lambda_dssim": 0.4,             # default: 0.4    | weight of the D-SSIM term in RGB loss
     "densification_interval": 100,   # default: 100
-    "opacity_reset_interval": 3000,  # resets only at 3000 & 6000 (< densify_until_iter)
+    "opacity_reset_interval": 3000,
     "densify_from_iter": 500,        # default: 500
-    "densify_until_iter": 45_000,    # default: 45_000
+    "densify_until_iter": 30_000,
     "densify_grad_threshold": 0.0002,# default: 0.0002
-    "max_gaussians": 450_000,        # hard cap on #gaussians (0 = unlimited)
+    "max_gaussians": 0,              # unlimited, like the reference (was 450k)
+
+    # TV weight on metallic/roughness: the reference launch scripts use 0.05
+    # (engine default is 0.1).
+    "reg_material_weight": 0.05,
 
     "eval_interval": 5_000,          # evaluate metrics every N iters
     "visual_interval": 5_000,        # save visual comparisons every N iters
 
-    # Keep disk usage small: only save/checkpoint at the very end.
-    # Denser cadence around 40-50k so the best relight checkpoint (which for the
-    # baseline peaks ~44k before the post-densify overfit) is captured.
-    "save_iterations": [20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
-    "test_iterations": [20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
-    "checkpoint_iterations": [20_000, 30_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 60_000],
+    "save_iterations": [20_000, 25_000, 30_000, 35_000, 40_000],
+    "test_iterations": [20_000, 25_000, 30_000, 35_000, 40_000],
+    "checkpoint_iterations": [20_000, 25_000, 30_000, 35_000, 40_000],
 
     # Prior loss weights (used by every run that optimizes the priors).
     # A weight is auto-forced to 0 when its *_gt_dir (set per-dataset) is "".
@@ -189,7 +227,36 @@ COMMON = {
     # Envmap-neutrality regularizer. Kept small for prior runs (GT albedo helps
     # resolve the albedo/light-colour ambiguity); baseline raises it slightly.
     "reg_hdr_weight": 0.0001,
+
+    # Relight eval on 24 of the 200 test cameras (deterministic subset): the
+    # full 6-HDRI x 200-view relight eval took ~1 h per eval point in try_7.
+    "relight_max_views": 24,
 }
+
+# reduce_geo_lr_third_stage — optimizer-level, time-scheduled, loss-agnostic.
+# It scales the learning rates of the geometry parameters (xyz, scaling, rotation), cosine-annealed 
+# from 1.0 down to the given factor between second_stage_step and geo_lr_final_iter, then held. 
+# It throttles how fast geometry can move regardless of which loss produced the gradient — the photometric loss, 
+# the normal prior, and the albedo prior are all slowed equally. It answers: "how plastic is geometry over time?"
+# 
+# prior_geom_grad_scale — gradient-path-level, constant, loss-selective.
+# It scales (0.0 = blocks) the geometry gradients flowing through one specific path: 
+# the stage-3 albedo/material prior rasters. The rendered maps are unchanged in the 
+# forward pass; only the backward contribution of those rasters to means/scales/rotations/opacity is damped. 
+# The photometric loss and the normal prior keep full-strength geometry gradients. 
+# It answers: "which losses are allowed to shape geometry at all?" This targets the 
+# try_5 failure mode directly — per-view-inconsistent diffusion albedo restructuring 
+# gaussians through the raster (zncc → 63° normals vs zncc_grad → 36°).
+# 
+# The practical difference in your batch: the LR reduction is a blunt instrument 
+# — it's likely a big part of why try_5 prior runs lost ~4 dB test PSNR vs baseline 
+# (geometry at 5% LR couldn't recover from opacity resets and fresh densification clones).
+# The grad-scale is surgical — it removes only the harmful channel while leaving photometric 
+# geometry refinement at full speed. The _plus runs currently use both (LR→0.05 and grad-scale 0.0), 
+# which is somewhat redundant; if the batch confirms the grad-scale works, a natural follow-up is 
+# relaxing reduce_geo_lr_third_stage toward 0.3–1.0 to win back the photometric quality — 
+# that's the A/B I'd queue next.
+
 
 # =============================================================================
 # DATASETS  -- per-dataset overrides applied on top of COMMON
@@ -210,7 +277,7 @@ DATASETS = [
         "args": {
             "source_path": LEGO_DIR,
             "white_background": False,         # lego is a Blender-synthetic scene
-            "resolution": 2,                   # -1 = keep native resolution
+            "resolution": 4,                   # -1 = keep native resolution
             "albedo_gt_dir": "albedo_gt",      # WORLD-space GT albedo
             "normal_gt_dir": "normal_gt",      # WORLD-space GT normal
             "metallic_gt_dir": "metallic_simulated_zero",
@@ -242,109 +309,91 @@ DATASETS = [
 ]
 
 # =============================================================================
-# ALBEDO VARIANTS  -- the baseline + three albedo-prior formulations
+# ALBEDO VARIANTS  -- try_7: light-linear indirect + anchor/reg_hdr unbundling
 # =============================================================================
-# Each variant overrides only the albedo handling; all other settings come from
-# COMMON / the dataset. The three new formulations isolate WHAT the albedo prior
-# supervises (edges / relative distribution / structure) while staying invariant
-# to the global brightness / colour shift between Cycles and the GIR BRDF.
+# Every GT variant below copies the try_6 gt_zncc_grad_ctrl stage-1/2-relevant
+# parameters EXACTLY (tv_reduction_factor 0.75, lambda_normal_gt 0.8 from
+# COMMON, albedo warm-up on) so the warm-up-buffer fingerprint matches the
+# buffered try_6 checkpoints and only Phase 3 is recomputed. Same for the
+# diffusion variant vs the try_6 diff runs. All new knobs (anchor, LLI,
+# reg_hdr, roughness prior, detach) are Phase-3-only.
+_GT_BASE_ARGS = {
+    "albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75,
+    "reg_hdr_weight": 0.001,
+    "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 40_000,
+}
+_PRIOR_FLAGS = {
+    "use_prior_weight_scheduler": True,
+    "albedo_geometry_warmup": True,
+}
+
 ALBEDO_VARIANTS = [
     {
-        # baseline
-        "name": "baseline_no_prior",
-        "args": {"reg_hdr_weight": 0.001, "tv_reduction_factor": 1.0},
-        "flags": {"exclude_prior_loss": True},
+        # Anchor 0.05 WITHOUT LLI (re-run of the try_7 arm that OOMed on the
+        # 8 GB machine). The clean no-LLI reference for the new gain /
+        # envmap_mean_ratio metrics — plus_hdrfix cannot serve as that
+        # reference because it bundles roughness_video + prior_geom_grad_scale.
+        "name": "gt_zncc_grad_anchor",
+        "args": {**_GT_BASE_ARGS, "albedo_anchor_weight": 0.05},
+        "flags": dict(_PRIOR_FLAGS),
     },
     {
-        # photometric warmup zncc
-        "name": "photometric_warmup_zncc",
-        "args": {
-            "albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
-        },
-        "flags": {
-            "use_prior_weight_scheduler": True,
-            #"albedo_geometry_warmup": True,
-            #"disable_reset_third_stage": True,
-        },
+        # HEADLINE: anchor + LLI with the env_mean DETACH fix. vs try_7
+        # gt_zncc_grad_anchor_lli (same config, buggy LLI) this isolates the
+        # detach. Predictions: envmap logPSNR recovers 26 -> ~30 with the
+        # sunset core visible again, envmap_mean_ratio drops from ~1.4
+        # toward ~1.2, relight gain drops below 1.32, raw relight >= 25.
+        "name": "gt_zncc_grad_anchor_lli2",
+        "args": {**_GT_BASE_ARGS, "albedo_anchor_weight": 0.05},
+        "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
     },
     {
-        # albedo warmup zncc
-        "name": "albedo_warmup_zncc",
-        "args": {
-            "albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
-        },
-        "flags": {
-            "use_prior_weight_scheduler": True,
-            "albedo_geometry_warmup": True,
-            #"disable_reset_third_stage": True,
-        },
+        # zncc twin: best albedo of try_7 (31.2 dB raw, ~= aligned, i.e. the
+        # scale ambiguity is actually RESOLVED with anchor+zncc). Its relight
+        # trailed zncc_grad by only 0.2 dB aligned — if the fixed bounce
+        # closes that, plain zncc becomes the headline config.
+        "name": "gt_zncc_anchor_lli2",
+        "args": {**_GT_BASE_ARGS, "albedo_prior_mode": "zncc",
+                 "albedo_anchor_weight": 0.05},
+        "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
     },
     {
-        # photometric warmup direct
-        "name": "photometric_warmup_direct",
+        # Diffusion priors + fixed LLI (re-run of the OOMed try_7 arm). No
+        # anchor: the diffusion albedo's absolute scale is unreliable
+        # (anchoring to it cost 5 dB albedo PSNR in try_6).
+        "name": "diff_zncc_grad_lli2",
         "args": {
-            "albedo_prior_mode": "direct", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
-        },
-        "flags": {
-            "use_prior_weight_scheduler": True,
-            #"albedo_geometry_warmup": True,
-            #"disable_reset_third_stage": True,
-        },
-    },
-    {
-        # diffusion albedo warmup zncc
-        "name": "diffusion_zncc",
-        "args": {
-            "albedo_prior_mode": "zncc", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
-            "albedo_gt_dir": "albedo", 
+            **_GT_BASE_ARGS,
+            "albedo_gt_dir": "albedo",
             "normal_gt_dir": "normal",
             "metallic_gt_dir": "metallic_video",
             "roughness_gt_dir": "roughness_video",
             "normal_camera_convention": "opengl",
             "lambda_metallic_gt": 0.05,
+            "lambda_normal_gt": 0.4,
         },
-        "flags": {
-            "use_prior_weight_scheduler": True,
-            "albedo_geometry_warmup": True,
-            #"disable_reset_third_stage": True,
-        },
-    },
-    #{
-    #    # diffusion albedo warmup zncc grad
-    #    "name": "diffusion_zncc_grad",
-    #    "args": {
-    #        "albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
-    #        "albedo_gt_dir": "albedo", 
-    #        "normal_gt_dir": "normal",
-    #        "metallic_gt_dir": "metallic_video",
-    #        "roughness_gt_dir": "roughness_video",
-    #        "normal_camera_convention": "opengl",
-    #        "lambda_metallic_gt": 0.05,
-    #    },
-    #    "flags": {
-    #        "use_prior_weight_scheduler": True,
-    #        "albedo_geometry_warmup": True,
-    #        #"disable_reset_third_stage": True,
-    #    },
-    #},
-    {
-        # albedo warmup zncc
-        "name": "albedo_warmup_zncc_grad",
-        "args": {
-            "albedo_prior_mode": "zncc_grad", "tv_reduction_factor": 0.75, "reg_hdr_weight": 0.0045, "reduce_geo_lr_third_stage": 0.05, "geo_lr_final_iter": 45_000, 
-        },
-        "flags": {
-            "use_prior_weight_scheduler": True,
-            "albedo_geometry_warmup": True,
-            #"disable_reset_third_stage": True,
-        },
+        "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
     },
 ]
 
 # Where all run folders for this batch live.
-EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_4_presentation")
+EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_8_lli_detached")
 
-# Build the 8 experiments = every albedo variant on every dataset. Each
+# Finished runs from earlier batches to overlay in the comparison report
+# WITHOUT re-running them (name shown in the report, absolute model path).
+# NOTE: their relight metrics were computed over ALL 200 test views; the new
+# runs use 24 (expect ±0.1-0.2 dB sampling difference — do not over-read).
+_TRY6_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_6_hdr_rotation")
+_TRY7_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_7_light_linear_indirect")
+EXTERNAL_RUNS = [
+    ("t6_baseline_no_prior",   os.path.join(_TRY6_ROOT, "lego_baseline_no_prior")),
+    ("t6_gt_zncc_grad_ctrl",   os.path.join(_TRY6_ROOT, "lego_gt_zncc_grad_ctrl")),
+    ("t7_gt_zncc_grad_anchor_lli", os.path.join(_TRY7_ROOT, "lego_gt_zncc_grad_anchor_lli")),
+    ("t7_gt_zncc_anchor_lli",  os.path.join(_TRY7_ROOT, "lego_gt_zncc_anchor_lli")),
+    ("t7_gt_zncc_grad_plus_hdrfix", os.path.join(_TRY7_ROOT, "lego_gt_zncc_grad_plus_hdrfix")),
+]
+
+# Build the experiments = every albedo variant on every dataset. Each
 # experiment merges dataset args first, then the variant args (variant wins).
 EXPERIMENTS = []
 for _dataset in DATASETS:
@@ -396,6 +445,7 @@ WARMUP_FINGERPRINT_KEYS = [
 WARMUP_FINGERPRINT_FLAG_KEYS = [
     "white_background", "random_background",
     "exclude_prior_loss", "albedo_geometry_warmup",
+    "hdr_rotation",  # rotates the stage-2 envmap queries
 ]
 
 
@@ -412,10 +462,19 @@ def _full_config(exp):
     return cfg
 
 
+# Bump this whenever an ENGINE change alters what stages 1 & 2 compute, so
+# buffered checkpoints from before the change can never be reused.
+#   v2: envlight cubemap/latlong/FG-LUT sampling fixed (nvdiffrast dr.texture),
+#       camera-space diffusion normals, alpha-masked prior losses.
+#   v3: distCUDA2 scale init restored (reference behaviour); hdr_rotation now
+#       part of the fingerprint (affects the stage-2 light queries).
+WARMUP_CODE_VERSION = 3
+
+
 def warmup_fingerprint(exp):
     """Build the ordered dict of stage-1/2-influencing parameters for `exp`."""
     cfg = _full_config(exp)
-    fp = {}
+    fp = {"warmup_code_version": WARMUP_CODE_VERSION}
     for k in WARMUP_FINGERPRINT_KEYS:
         fp[k] = cfg.get(k, None)
     for k in WARMUP_FINGERPRINT_FLAG_KEYS:
@@ -525,6 +584,7 @@ def build_command(exp, model_path, start_checkpoint=None, ensure_checkpoint_iter
         "eval", "white_background", "exclude_prior_loss", "use_prior_weight_scheduler",
         "remove_noise", "hdr_rotation", "random_background", "quiet",
         "disable_reset_third_stage", "albedo_geometry_warmup",
+        "light_linear_indirect",
     }
 
     flags = dict(exp.get("flags", {}))
@@ -691,7 +751,8 @@ def generate_comparison(runs, out_dir):
         "grid.linestyle": "--",
     })
 
-    palette = ["#E91E63", "#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#00BCD4"]
+    palette = ["#E91E63", "#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#00BCD4",
+               "#795548", "#607D8B", "#F44336", "#3F51B5", "#8BC34A", "#FFC107"]
 
     data = []
     for i, (name, mp) in enumerate(runs):
@@ -823,6 +884,46 @@ def generate_comparison(runs, out_dir):
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
 
+        # \u2500\u2500 Page 3b: Energy calibration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # relight_<hdri>_gain is the fitted global gain g* (render -> GT):
+        # g* > 1 means the relit render is too DARK (the light-transport
+        # energy deficit); g* ~ 1 is calibrated. test_gain is the same fit
+        # under the TRAINING light (photometric loss pins it near 1; try_7:
+        # ~1.09) \u2014 the relight-vs-test gap is the relight-specific deficit.
+        # envmap_mean_ratio is learned-envmap brightness / GT-HDRI brightness;
+        # in try_7 it tracked the relight gain (the envmap absorbs the deficit).
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        fig.suptitle("Energy Calibration (fitted gain render\u2192GT; 1.0 = calibrated)",
+                     fontsize=14, fontweight="bold")
+        plot_avg_relight(axes[0, 0], "_gain", "gain g*", "Mean Relight Gain (\u21921.0)")
+        axes[0, 0].axhline(1.0, color="#888", linewidth=1, linestyle=":")
+        ax_gbar = axes[0, 1]
+        gain_hdris = sorted({k.replace("relight_", "").replace("_gain", "")
+                             for d in data for k in _relight_keys(d["metrics"], "_gain")})
+        if gain_hdris:
+            import numpy as np
+            x = np.arange(len(gain_hdris)); w = 0.8 / max(1, len(data))
+            for i, d in enumerate(data):
+                m = d["metrics"][-1] if d["metrics"] else {}
+                vals = [m.get(f"relight_{h}_gain", float("nan")) for h in gain_hdris]
+                ax_gbar.bar(x + i * w, vals, w, color=d["color"], label=d["name"])
+            ax_gbar.set_xticks(x + (len(data) - 1) * w / 2)
+            ax_gbar.set_xticklabels(gain_hdris, rotation=20, ha="right", fontsize=8)
+            ax_gbar.axhline(1.0, color="#888", linewidth=1, linestyle=":")
+            ax_gbar.set_ylabel("gain g*"); ax_gbar.set_title("Final per-HDRI Relight Gain (\u21921.0)")
+            ax_gbar.legend(loc="best", fontsize=7)
+        else:
+            ax_gbar.text(0.5, 0.5, "No gain data (pre-try_7 runs)", ha="center",
+                         va="center", transform=ax_gbar.transAxes)
+        plot_metric(axes[1, 0], "test_gain", "gain g*",
+                    "Train-light Gain (sanity ref, \u22481)")
+        axes[1, 0].axhline(1.0, color="#888", linewidth=1, linestyle=":")
+        plot_metric(axes[1, 1], "envmap_mean_ratio", "model / GT",
+                    "EnvMap Brightness Ratio (\u21921.0)")
+        axes[1, 1].axhline(1.0, color="#888", linewidth=1, linestyle=":")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
         # ── Page 4: Prior losses ───────────────────
         fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
         fig.suptitle("Prior Losses",
@@ -847,10 +948,10 @@ def generate_comparison(runs, out_dir):
 
     # ── CSV summary of final metrics ─────────────────────────────────────
     with open(csv_path, "w") as f:
-        cols = ["run", "test_psnr", "test_psnr_aligned", "test_ssim", "test_lpips",
-                "mean_relight_psnr", "mean_relight_psnr_aligned", "mean_relight_ssim",
-                "test_albedo_psnr", "test_normal_ang_err", "test_metallic_mae", "test_roughness_mae",
-                "envmap_log_psnr", "envmap_rel_l1",
+        cols = ["run", "test_psnr", "test_psnr_aligned", "test_gain", "test_ssim", "test_lpips",
+                "mean_relight_psnr", "mean_relight_psnr_aligned", "mean_relight_gain", "mean_relight_ssim",
+                "test_albedo_psnr", "test_albedo_psnr_aligned", "test_normal_ang_err", "test_metallic_mae", "test_roughness_mae",
+                "envmap_log_psnr", "envmap_rel_l1", "envmap_mean_ratio",
                 "albedo_gt", "normal_gt", "metallic_gt", "roughness_gt", "num_gaussians"]
         f.write(",".join(cols) + "\n")
         for d in data:
@@ -858,14 +959,15 @@ def generate_comparison(runs, out_dir):
             lc = d["loss"][-1] if d["loss"] else {}
             _, rp = _avg_relight_series(d["metrics"], "_psnr")
             _, rpa = _avg_relight_series(d["metrics"], "_psnr_aligned")
+            _, rg = _avg_relight_series(d["metrics"], "_gain")
             _, rs = _avg_relight_series(d["metrics"], "_ssim")
             row = [
                 d["name"],
-                m.get("test_psnr", ""), m.get("test_psnr_aligned", ""), m.get("test_ssim", ""), m.get("test_lpips", ""),
-                rp[-1] if rp else "", rpa[-1] if rpa else "", rs[-1] if rs else "",
-                m.get("test_albedo_psnr", ""), m.get("test_normal_ang_err", ""),
+                m.get("test_psnr", ""), m.get("test_psnr_aligned", ""), m.get("test_gain", ""), m.get("test_ssim", ""), m.get("test_lpips", ""),
+                rp[-1] if rp else "", rpa[-1] if rpa else "", rg[-1] if rg else "", rs[-1] if rs else "",
+                m.get("test_albedo_psnr", ""), m.get("test_albedo_psnr_aligned", ""), m.get("test_normal_ang_err", ""),
                 m.get("test_metallic_mae", ""), m.get("test_roughness_mae", ""),
-                m.get("envmap_log_psnr", ""), m.get("envmap_rel_l1", ""),
+                m.get("envmap_log_psnr", ""), m.get("envmap_rel_l1", ""), m.get("envmap_mean_ratio", ""),
                 lc.get("albedo_gt", ""), lc.get("normal_gt", ""), lc.get("metallic_gt", ""), lc.get("roughness_gt", ""),
                 m.get("num_gaussians", ""),
             ]
@@ -900,11 +1002,25 @@ def main():
             sys.exit(1)
 
     runs = []
+    # Overlay finished runs from earlier batches (never re-run here). Listed
+    # first so the report orders them as the reference curves.
+    for name, path in EXTERNAL_RUNS:
+        if os.path.exists(os.path.join(path, "metrics_log.json")):
+            runs.append((name, path))
+        else:
+            print(f"[external] WARNING: '{path}' has no metrics_log.json; skipped.")
+
     if args.report_only:
         for e in selected:
             runs.append((e["name"], os.path.join(EXPERIMENT_ROOT, e["name"])))
     else:
         os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
+        # Archive this script alongside the results so the batch config is
+        # preserved even after the file is edited for the next batch.
+        try:
+            shutil.copy2(os.path.abspath(__file__), os.path.join(EXPERIMENT_ROOT, "run_experiments.py"))
+        except shutil.SameFileError:
+            pass
         for e in selected:
             model_path, rc = run_experiment(e, use_buffer=not args.no_buffer)
             runs.append((e["name"], model_path))

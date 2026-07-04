@@ -23,9 +23,9 @@ from gaussian_renderer import GaussianModel
 import numpy as np
 from envlight.utils import cubemap_to_latlong
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, render_religt=False, second_stage_step = 30000, hdr_rotation = False):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, render_religt=False, second_stage_step = 30000, hdr_rotation = False, light_linear_indirect=False):
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        render_pkg = render(view, gaussians, pipeline, background, iteration=iteration, is_train= not render_religt, second_stage_step=second_stage_step, hdr_rotation=hdr_rotation)
+        render_pkg = render(view, gaussians, pipeline, background, iteration=iteration, is_train= not render_religt, second_stage_step=second_stage_step, hdr_rotation=hdr_rotation, light_linear_indirect=light_linear_indirect)
         image = render_pkg["render"]
         
         gt = view.original_image[0:3, :, :]
@@ -39,7 +39,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             makedirs(gts_path, exist_ok=True)
             torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, save_name : str, render_religt : bool, second_stage_step : int, hdr_rotation : bool, environment_texture : str, environment_scale : float = 1.0):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, save_name : str, render_religt : bool, second_stage_step : int, hdr_rotation : bool, environment_texture : str, environment_scale : float = 1.0, light_linear_indirect : bool = False):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, environment_texture=environment_texture, environment_scale=environment_scale)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -49,10 +49,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-             render_set(dataset.model_path, "train_"+save_name, scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, render_religt, second_stage_step, hdr_rotation)
+             render_set(dataset.model_path, "train_"+save_name, scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, render_religt, second_stage_step, hdr_rotation, light_linear_indirect)
 
         if not skip_test:
-             render_set(dataset.model_path, "test_"+save_name, scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, render_religt, second_stage_step, hdr_rotation)
+             render_set(dataset.model_path, "test_"+save_name, scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, render_religt, second_stage_step, hdr_rotation, light_linear_indirect)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -68,12 +68,13 @@ if __name__ == "__main__":
     parser.add_argument("--second_stage_step", default=30000, type=int)
     parser.add_argument("--hdr_rotation", action="store_true")
     parser.add_argument("--environment_texture", type=str, default="hdri/flower_road_no_sun_2k.hdr")
+    parser.add_argument("--light_linear_indirect", action="store_true")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.save_name, args.render_relight, args.second_stage_step, args.hdr_rotation, args.environment_texture)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.save_name, args.render_relight, args.second_stage_step, args.hdr_rotation, args.environment_texture, light_linear_indirect=args.light_linear_indirect)
 
     

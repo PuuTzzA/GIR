@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import imageio
+import nvdiffrast.torch as dr
 from . import renderutils as ru
 from .utils import *
 
@@ -132,31 +133,29 @@ class EnvLight(torch.nn.Module):
         
 
     def __call__(self, l, roughness=None):
-        import torch.nn.functional as F
-        
-        # Determine if we are doing Diffuse (no roughness) or Specular (with roughness)
+        # l: [..., 3] unit direction from the shaded point toward the light,
+        # sampled from the prefiltered cubemaps with nvdiffrast's cube-boundary
+        # texture lookup (the direction itself indexes the cube face).
+        prefix = l.shape[:-1]
+        if len(prefix) != 3:  # reshape to [B, H, W, -1]
+            l = l.reshape(1, 1, -1, l.shape[-1])
+            if roughness is not None:
+                roughness = roughness.reshape(1, 1, -1, 1)
+
         if roughness is None:
-            # Diffuse Path
-            tex = self.diffuse[None, ...] if self.diffuse.dim() == 3 else self.diffuse
+            # diffuse (irradiance) lookup
+            light = dr.texture(self.diffuse[None, ...], l.contiguous(), filter_mode='linear', boundary_mode='cube')
         else:
-            # Specular Path - use the base image (simplified MIP bypass)
-            tex = self.image[None, ...] if self.image.dim() == 3 else self.image
+            # specular lookup with roughness-dependent mip level
+            miplevel = self.get_mip(roughness)
+            light = dr.texture(
+                self.specular[0][None, ...],
+                l.contiguous(),
+                mip=list(m[None, ...] for m in self.specular[1:]),
+                mip_level_bias=miplevel[..., 0],
+                filter_mode='linear-mipmap-linear',
+                boundary_mode='cube',
+            )
 
-        # 1. Prepare Texture [Batch, Channels, H, W]
-        if tex.dim() == 3: # Latlong [H, W, C]
-            tex_pt = tex.permute(0, 3, 1, 2)
-        else: # Cubemap [6, H, W, C]
-            tex_pt = tex.permute(0, 3, 1, 2)
-
-        # 2. Prepare Grid [-1, 1]
-        # l is [N, 3] or [N, 2]. We need [Batch, 1, N, 2]
-        grid = torch.stack([l[..., 0] * 2.0 - 1.0, 1.0 - 2.0 * l[..., 1]], dim=-1)
-        grid = grid.reshape(1, 1, -1, 2).expand(tex_pt.shape[0], -1, -1, -1)
-
-        # 3. Sample
-        sampled = F.grid_sample(tex_pt, grid, mode='bilinear', padding_mode='border', align_corners=False)
-        
-        # 4. Aggregate (Mean across faces if cubemap)
-        light = sampled.mean(dim=0).permute(1, 2, 0).reshape(-1, 3)
-        
+        light = light.view(*prefix, -1)
         return light

@@ -336,7 +336,7 @@ class GaussianModel:
                     pts_weight = torch.sum(pts_weight, dim=-1)
                     self.diffuse_occ[start:end, i] = (pts_weight > 1).float()
 
-    def compute_color(self, camera_center, iteration=None, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, exposure=0.0):
+    def compute_color(self, camera_center, iteration=None, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, exposure=0.0, light_linear_indirect=False):
         means3D = self.get_xyz
         if remove_noise:
             v = camera_center - means3D
@@ -373,24 +373,45 @@ class GaussianModel:
         prefix_shape = albedo.shape[:-1]
         diffuse_albedo = (1 - metallic) * albedo
         fg_uv = torch.cat([n_dot_v, roughness], -1).clamp(0, 1)
-        # --- THE ULTIMATE PYTORCH BYPASS ---
-        import torch.nn.functional as F
-        lut = self.get_FG_LUT.permute(0, 3, 1, 2) # Convert to PyTorch layout [1, 2, 256, 256]
-        
-        # Convert OpenGL (0 to 1) coordinates to PyTorch (-1 to 1) coordinates
-        u = fg_uv[:, 0] * 2.0 - 1.0
-        v = 1.0 - 2.0 * fg_uv[:, 1]
-        grid = torch.stack([u, v], dim=-1).reshape(1, -1, 1, 2) 
-        
-        # Sample the texture natively
-        fg = F.grid_sample(lut, grid, mode="bilinear", padding_mode="border", align_corners=False)
-        fg = fg.permute(0, 2, 3, 1).reshape(*prefix_shape, 2)
-        # -----------------------------------
+        fg = dr.texture(
+            self.get_FG_LUT,
+            fg_uv.reshape(1, -1, 1, 2).contiguous(),
+            filter_mode="linear",
+            boundary_mode="clamp",
+        ).reshape(*prefix_shape, 2)
         F0 = (1 - metallic) * 0.04 + metallic * albedo
         specular_albedo = F0 * fg[:, 0:1] + fg[:, 1:2]
         if is_train:
             envlight.build_base()
         envlight.build_mips()
+        # ── Light-linear indirect illumination ──────────────────────────────
+        # The baked bounce terms (per-gaussian SH "indirect" and the diffuse
+        # bounce below) are expressed as REFLECTANCE x mean radiance of the
+        # CURRENT environment map instead of absolute radiance. During training
+        # this is a reparameterization (env_mean is just a scalar factor the SH
+        # absorbs); at relight the envmap is swapped and env_mean changes with
+        # it, so the bounce energy rescales with the new light instead of
+        # staying frozen at the training light's level. This closes the global
+        # energy deficit of the binary occlusion model: occluded directions no
+        # longer contribute zero (diffuse) / baked-radiance (specular) light.
+        env_mean = None
+        if light_linear_indirect and iteration > second_stage_step:
+            # DETACHED: env_mean must be a pure read-out of the current envmap,
+            # never a gradient path into it. In try_7 the bounce gradient
+            # flowed into the mean and the optimizer inflated it by pumping a
+            # few tiny ultra-bright texels (mean 3.3x the GT sunset) while the
+            # rest of the map went dark — envmap log-corr collapsed 0.69->0.28
+            # and the bounce term under-scaled at relight (native mean), so the
+            # relight gain stalled at ~1.3. With the detach, envmap gradients
+            # only come from the direct terms; the SH reflectance alone adapts
+            # the bounce, and at relight env_mean still rescales with the
+            # swapped HDRI (the light-linear property is untouched).
+            env_mean = envlight.base.detach().mean(dim=(0, 1, 2)).clamp_min(1e-4)  # (3,)
+            indirect_light = indirect_light * env_mean
+            # Per-gaussian diffuse bounce "reflectance" from the same SH field,
+            # evaluated at the (world-frame, pre-rotation) shading normal.
+            diffuse_bounce = torch.clamp_min(
+                eval_sh(self.active_sh_degree, shs_view, shading_normal) + 0.5, 0.0) * env_mean
         if iteration > second_stage_step:
             # Process diffuse lighting in point-chunks to avoid OOM
             _pchunk = 4096
@@ -407,7 +428,17 @@ class GaussianModel:
                     chunk_dirs = torch.cat([-dy, dz, -dx], dim=-1)
                 chunk_light = envlight(chunk_dirs)
                 chunk_occ = rearrange(self.diffuse_occ[pstart:pend], "B N -> (B N)").unsqueeze(1)
-                chunk_light = (1 - chunk_occ) * chunk_light
+                if light_linear_indirect:
+                    # Occluded sample directions receive the per-gaussian bounce
+                    # term (reflectance x current-env mean radiance) instead of
+                    # zero, so concave regions are no longer starved of energy
+                    # relative to the path-traced GT — and the compensation
+                    # transfers to unseen HDRIs because it scales with env_mean.
+                    bounce = diffuse_bounce[pstart:pend].unsqueeze(1) \
+                        .expand(-1, self.diffuse_sample_num, -1).reshape(-1, 3)
+                    chunk_light = (1 - chunk_occ) * chunk_light + chunk_occ * bounce
+                else:
+                    chunk_light = (1 - chunk_occ) * chunk_light
                 chunk_light = rearrange(chunk_light, "(B N) C -> B N C", N=self.diffuse_sample_num)
                 diffuse_light[pstart:pend] = torch.mean(chunk_light, dim=1)
         else:
@@ -504,9 +535,7 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        # dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        num_points = fused_point_cloud.shape[0]
-        dist2 = torch.full((num_points,), 0.01, dtype=torch.float32, device="cuda")
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1

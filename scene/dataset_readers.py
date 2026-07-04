@@ -187,7 +187,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, albedo_dir="albedo_gt", normal_dir="normal_gt", metallic_dir="", roughness_dir=""):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", gt_priors_dir=None, albedo_dir="albedo_gt", normal_dir="normal_gt", metallic_dir="", roughness_dir="", normal_in_camera_space=False):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -199,7 +199,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             fovx = contents["camera_angle_x"] 
 
         if "exposure" in contents.keys():
-            exposure = frame["exposure"]
+            exposure = contents["exposure"]
         else:
             exposure = 0.0
 
@@ -237,8 +237,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 FovX = focal2fov(focal_length, image.size[0])
             else:
                 fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-                FovY = fovx 
-                FovX = fovy
+                FovY = fovy
+                FovX = fovx
 
             # --- Load GT priors from the configured per-property folders ---
             # Each prior reads <gt_priors_dir>/<folder>/<prop>_<idx>.png; the file
@@ -274,8 +274,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], exposure=exposure,
-                            albedo_gt=albedo_gt_img, normal_gt=normal_gt_img, metallic_gt=metallic_gt, roughness_gt=roughness_gt))
-            
+                            albedo_gt=albedo_gt_img, normal_gt=normal_gt_img, metallic_gt=metallic_gt, roughness_gt=roughness_gt,
+                            normal_in_camera_space=normal_in_camera_space))
+
     return cam_infos
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
@@ -354,19 +355,29 @@ def readSyntheticWithPriorsInfo(path, white_background, eval, extension=".png",
     if has_test_gt:
         print(f"Found GT prior folders in test split: {test_found}")
 
+    # Only the Blender-rendered "normal_gt" folder stores WORLD-space normals.
+    # Every other normal folder (e.g. "normal", "normal_video") comes from a
+    # per-view diffusion model and is therefore in CAMERA space; flag it so the
+    # training code rotates those priors into world space using the camera pose.
+    normal_in_camera_space = normal_dir not in ("", "normal_gt")
+    if normal_in_camera_space:
+        print(f"Normal prior folder '{normal_dir}' is a diffusion prior -> treating normals as CAMERA-space")
+
     print("Reading Synthetic-with-Priors Training Transforms")
     train_cam_infos = readCamerasFromTransforms(
         path, "transforms_train.json", white_background, extension,
         gt_priors_dir=train_gt_dir if has_train_gt else None,
         albedo_dir=albedo_dir, normal_dir=normal_dir,
-        metallic_dir=metallic_dir, roughness_dir=roughness_dir)
+        metallic_dir=metallic_dir, roughness_dir=roughness_dir,
+        normal_in_camera_space=normal_in_camera_space)
 
     print("Reading Synthetic-with-Priors Test Transforms")
     test_cam_infos = readCamerasFromTransforms(
         path, "transforms_test.json", white_background, extension,
         gt_priors_dir=test_gt_dir if has_test_gt else None,
         albedo_dir=albedo_dir, normal_dir=normal_dir,
-        metallic_dir=metallic_dir, roughness_dir=roughness_dir)
+        metallic_dir=metallic_dir, roughness_dir=roughness_dir,
+        normal_in_camera_space=normal_in_camera_space)
 
     if not eval:
         train_cam_infos.extend(test_cam_infos)

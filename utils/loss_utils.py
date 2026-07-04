@@ -126,6 +126,17 @@ def _foreground_mask(gt, eps=1e-6):
     return (gt.sum(dim=0, keepdim=True) > eps).to(gt.dtype)
 
 
+def _prior_mask(gt, alpha_mask=None):
+    """Foreground mask for a prior loss: non-zero GT pixels, optionally
+    intersected with the dataset alpha mask (1xHxW). The alpha mask matters for
+    diffusion priors, whose background pixels contain hallucinated values that
+    the non-zero-GT heuristic alone would keep."""
+    fg = _foreground_mask(gt)
+    if alpha_mask is not None:
+        fg = fg * (alpha_mask > 0.5).to(gt.dtype)
+    return fg
+
+
 def _ssim_structure_loss(img1, img2, window_size=11, lum_weight=0.1):
     """Structure/contrast-focused SSIM loss.
 
@@ -164,7 +175,8 @@ def _ssim_structure_loss(img1, img2, window_size=11, lum_weight=0.1):
     return 1.0 - ssim_struct.mean()
 
 
-def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
+def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1, alpha_mask=None,
+                      state=None, ema_beta=0.99):
     """GT-supervised albedo loss with selectable invariance to the
     albedo<->light intensity/colour ambiguity.
 
@@ -205,9 +217,28 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
       * "ssim_struct" : SSIM on the albedo with the luminance term heavily
                         down-weighted, so shapes / textures must match the GT but
                         absolute brightness / contrast may drift.
+      * "si_ema"      : scale-invariant log loss with a GLOBALLY-SHARED gain.
+                        The one true ambiguity of the GIR decomposition is a
+                        single per-channel gain between predicted albedo and the
+                        prior (absorbed by envmap intensity / colour). Per-view
+                        invariant losses (zncc, lstsq, log_chroma) grant that
+                        freedom PER VIEW, which lets per-view baked shading
+                        survive and forfeits cross-view consistency. Here the
+                        per-channel log-gain is estimated robustly (median over
+                        the foreground) each view but SHARED across views via an
+                        EMA (`state` dict, `ema_beta`): the data term is a Huber
+                        penalty on the log residual after removing the shared
+                        gain, plus a log-gradient term (inherently gain-
+                        invariant) that pins texture edges and suppresses
+                        low-frequency baked-shading gradients. Robust to the
+                        per-view exposure / white-balance jitter of diffusion
+                        priors, while still pinning absolute albedo structure
+                        and relative colour everywhere.
+                        Pass a persistent dict as `state` to enable the shared
+                        gain (falls back to the per-view gain when None).
     """
     if mode == "lstsq":
-        mask = _foreground_mask(gt)
+        mask = _prior_mask(gt, alpha_mask)
         # Closed-form per-channel gain s_c = <r,g> / <r,r> over foreground.
         num = (rendered * gt * mask).sum(dim=(1, 2))
         den = (rendered * rendered * mask).sum(dim=(1, 2)).clamp_min(1e-8)
@@ -219,7 +250,7 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
 
     if mode == "log_chroma":
         eps = 1e-3
-        mask = _foreground_mask(gt)
+        mask = _prior_mask(gt, alpha_mask)
         # Chromaticity: intensity-invariant colour (per-pixel channel ratios).
         chroma_r = rendered / (rendered.sum(dim=0, keepdim=True) + eps)
         chroma_g = gt / (gt.sum(dim=0, keepdim=True) + eps)
@@ -240,7 +271,7 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
         # neighbouring pixels, not the absolute colour, so a global brightness
         # or energy-conservation shift in the GT is ignored while texture
         # boundaries / edges are forced to land in the same places.
-        mask = _foreground_mask(gt)
+        mask = _prior_mask(gt, alpha_mask)
         # Finite-difference image gradients (signed).
         r_dx = rendered[:, :, 1:] - rendered[:, :, :-1]
         g_dx = gt[:, :, 1:] - gt[:, :, :-1]
@@ -260,7 +291,7 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
         # the rendered and GT albedo per channel over the foreground, then
         # compare. Invariant to a per-channel linear transform (gain + bias).
         eps = 1e-4
-        mask = _foreground_mask(gt)
+        mask = _prior_mask(gt, alpha_mask)
         n = mask.sum().clamp_min(1.0)
 
         def _standardize(x):
@@ -287,7 +318,7 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
             window = window.cuda(rendered.get_device())
         window = window.type_as(rendered)
 
-        mask = _foreground_mask(gt)
+        mask = _prior_mask(gt, alpha_mask)
         r = rendered * mask
         g = gt * mask
 
@@ -309,7 +340,7 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
         # low-frequency baked shading), then standardise each gradient channel
         # over the foreground and maximise the global correlation.
         eps = 1e-4
-        mask = _foreground_mask(gt)
+        mask = _prior_mask(gt, alpha_mask)
         r_dx = rendered[:, :, 1:] - rendered[:, :, :-1]
         g_dx = gt[:, :, 1:] - gt[:, :, :-1]
         r_dy = rendered[:, 1:, :] - rendered[:, :-1, :]
@@ -334,6 +365,51 @@ def albedo_prior_loss(rendered, gt, mode="direct", lambda_dssim=0.4, delta=0.1):
         # Structure-focused SSIM: match shapes / textures of the GT albedo while
         # down-weighting absolute brightness (luminance) and contrast drift.
         return _ssim_structure_loss(rendered, gt, lum_weight=0.1)
+
+    if mode == "si_ema":
+        # Scale-invariant log loss with a globally-shared per-channel gain.
+        # eps also acts as a dark floor so log-domain terms do not blow up the
+        # (noisy) near-black pixels of diffusion priors.
+        eps = 1e-2
+        mask = _prior_mask(gt, alpha_mask)
+        mb = mask.squeeze(0) > 0.5
+        log_r = torch.log(rendered.clamp_min(0.0) + eps)
+        log_g = torch.log(gt.clamp_min(0.0) + eps)
+        d = log_g - log_r  # per-pixel log-gain the prediction is missing
+
+        # Robust per-view per-channel log-gain (median over the foreground).
+        if mb.any():
+            m = torch.stack([d[c][mb].median() for c in range(d.shape[0])]).detach()
+        else:
+            m = torch.zeros(d.shape[0], device=d.device)
+
+        # Share the gain across views via an EMA so every view is pulled toward
+        # the SAME globally-aligned albedo (a per-view gain would re-admit the
+        # per-view shading/exposure freedom this mode is designed to remove).
+        if state is not None:
+            g_prev = state.get("si_ema_log_gain")
+            g = m if g_prev is None else ema_beta * g_prev + (1.0 - ema_beta) * m
+            state["si_ema_log_gain"] = g.detach()
+        else:
+            g = m
+        g = g.view(-1, 1, 1)
+
+        # Data term: pin the log-albedo up to the shared global gain.
+        loss_data = huber_loss(d, g.expand_as(d), delta, mask=mask)
+
+        # Log-gradient term: gain-invariant by construction; forces GT texture
+        # edges to be reproduced and penalises low-frequency baked-shading
+        # gradients that have no counterpart in the prior.
+        r_dx = log_r[:, :, 1:] - log_r[:, :, :-1]
+        g_dx = log_g[:, :, 1:] - log_g[:, :, :-1]
+        r_dy = log_r[:, 1:, :] - log_r[:, :-1, :]
+        g_dy = log_g[:, 1:, :] - log_g[:, :-1, :]
+        mask_dx = mask[:, :, 1:] * mask[:, :, :-1]
+        mask_dy = mask[:, 1:, :] * mask[:, :-1, :]
+        loss_grad = (huber_loss(r_dx, g_dx, delta, mask=mask_dx)
+                     + huber_loss(r_dy, g_dy, delta, mask=mask_dy))
+
+        return loss_data + loss_grad
 
     # Default: "direct"
     data = huber_loss(rendered, gt, delta)

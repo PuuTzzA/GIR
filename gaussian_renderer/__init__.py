@@ -15,7 +15,28 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import RGB2SH
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, random_bg_color = None, iteration=None, scaling_modifier = 1.0, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, albedo_geometry_warmup=False):
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in the forward pass; scales the gradient by `scale` in the
+    backward pass. scale=0 is equivalent to .detach(), scale=1 is a no-op."""
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
+def _scale_grad(x, scale):
+    if x is None or scale >= 1.0:
+        return x
+    if scale <= 0.0:
+        return x.detach()
+    return _ScaleGrad.apply(x, scale)
+
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, random_bg_color = None, iteration=None, scaling_modifier = 1.0, is_train=None, first_stage_step=5000, second_stage_step=30000, remove_noise=False, hdr_rotation=False, albedo_geometry_warmup=False, prior_geom_grad_scale=1.0, light_linear_indirect=False):
     """
     Render the scene. 
     
@@ -111,11 +132,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # the warm-up (do NOT zero _albedo_init).
             if not albedo_geometry_warmup:
                 pc._albedo_init.data = torch.zeros_like(pc._albedo_init)
+            else:
+                # During the warm-up the flat albedo was rasterised directly and
+                # compared against the (sRGB-encoded) GT albedo images, so
+                # _albedo_init holds sRGB values. The PBR stage instead treats
+                # the albedo as LINEAR (the BRDF multiplies it with light and
+                # only the output is sRGB-encoded). Convert once at the boundary
+                # so the carried-over albedo means the same thing in both stages.
+                from utils.ir_utils import srgb_to_linear
+                pc._albedo_init.data = srgb_to_linear(pc.get_albedo_init.detach()) - 0.5
             pc._features_dc.data = torch.zeros_like(pc._features_dc)
             pc._features_rest.data = torch.zeros_like(pc._features_rest)
             pc._metallic_init.data = torch.rand_like(pc._metallic_init) * 0.2
             pc._roughness_init.data = torch.rand_like(pc._roughness_init)
-        result = pc.compute_color(viewpoint_camera.camera_center, iteration, is_train, first_stage_step, second_stage_step, remove_noise, hdr_rotation, viewpoint_camera.exposure)
+        result = pc.compute_color(viewpoint_camera.camera_center, iteration, is_train, first_stage_step, second_stage_step, remove_noise, hdr_rotation, viewpoint_camera.exposure, light_linear_indirect=light_linear_indirect)
 
         colors_precomp = result["color"]
         albedo = result["albedo"]
@@ -168,26 +198,45 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+        # The albedo / material prior losses are meant to teach the MATERIAL
+        # values, but the raster is differentiable w.r.t. geometry too, so a
+        # strong per-pixel prior can restructure gaussians to satisfy each
+        # view's (possibly inconsistent) prior — churning geometry that the
+        # photometric/normal losses already placed. `prior_geom_grad_scale`
+        # dampens the geometry gradients of the albedo/material rasters:
+        # 1.0 = unchanged, 0.0 = fully blocked (geometry then stays owned by
+        # the photometric + normal losses, which always keep full gradients),
+        # intermediate values let the priors nudge geometry gently.
+        if prior_geom_grad_scale < 1.0:
+            p_means3D = _scale_grad(means3D, prior_geom_grad_scale)
+            p_means2D = torch.zeros_like(means3D)
+            p_opacity = _scale_grad(opacity, prior_geom_grad_scale)
+            p_scales = _scale_grad(scales, prior_geom_grad_scale)
+            p_rotations = _scale_grad(rotations, prior_geom_grad_scale)
+            p_cov3D = _scale_grad(cov3D_precomp, prior_geom_grad_scale)
+        else:
+            p_means3D, p_means2D, p_opacity = means3D, means2D, opacity
+            p_scales, p_rotations, p_cov3D = scales, rotations, cov3D_precomp
         rendered_material, _, _, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
+            means3D = p_means3D,
+            means2D = p_means2D,
             shs = shs,
             colors_precomp = render_material,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+            opacities = p_opacity,
+            scales = p_scales,
+            rotations = p_rotations,
+            cov3D_precomp = p_cov3D)
         rendered_metallic = rendered_material[0:1,...].repeat(3,1,1)
         rendered_roughness = rendered_material[1:2,...].repeat(3,1,1)
         rendered_albedo, _, _, _ = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
+            means3D = p_means3D,
+            means2D = p_means2D,
             shs = shs,
             colors_precomp = albedo,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+            opacities = p_opacity,
+            scales = p_scales,
+            rotations = p_rotations,
+            cov3D_precomp = p_cov3D)
     elif iteration > first_stage_step:
         # Phase 2 (normal alignment): the geometry-derived shading normal must be
         # differentiable EVERY iteration so the GT-normal prior can supervise the
