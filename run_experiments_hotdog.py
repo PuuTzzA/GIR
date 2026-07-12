@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+HOTDOG HOTDOG
 Experiment runner + multi-run comparison report for the (modified) GIR engine.
 
 This script launches several training runs that differ ONLY in how the
@@ -202,10 +203,10 @@ REPO_DIR = os.path.dirname(GIR_DIR)
 # The stage boundaries realise the 3-phase pipeline described in the module
 # docstring; densification / opacity-reset are arranged to FINISH well before
 # the end so nothing disturbs the final gaussians.
-LEGO_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "lego")
+HOTDOG_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "hotdog")
 REAL_LIFE_DIR = os.path.join(REPO_DIR, "data", "datasets_with_priors", "bicycle")
 
-LEGO_DIR_RELIGHT_HDRs = ["fireplace", "night", "snow", "city", "courtyard", "forest"]  # HDRIs for blender datasets (lego, armadillo)
+HOTDOG_DIR_RELIGHT_HDRs = ["fireplace", "bridge", "night", "snow", "city", "courtyard", "forest"]  # HDRIs for blender datasets (lego, armadillo)
 REAL_LIFE_DIR_RELIGHT_HDRs = []                          # real photos: no relight GT, so empty
 
 COMMON = {
@@ -348,17 +349,17 @@ COMMON = {
 #           No relight GT and no GT base HDRI, so those are left empty.
 DATASETS = [
     {
-        "name": "lego",
+        "name": "hotdog",
         "args": {
-            "source_path": LEGO_DIR,
-            "white_background": False,         # lego is a Blender-synthetic scene
+            "source_path": HOTDOG_DIR,
+            "white_background": False,         # hotdog is a Blender-synthetic scene
             "resolution": 2,                   # 800x800 native -> 400x400 (-r 2)
             "albedo_gt_dir": "albedo_gt",      # WORLD-space GT albedo
             "normal_gt_dir": "normal_gt",      # WORLD-space GT normal
             "metallic_gt_dir": "metallic_simulated_zero",
             "roughness_gt_dir": "",
-            "eval_relight_hdris": LEGO_DIR_RELIGHT_HDRs,
-            "envmap_gt_path": os.path.join(LEGO_DIR, "hdris", "sunset.hdr"),
+            "eval_relight_hdris": HOTDOG_DIR_RELIGHT_HDRs,
+            "envmap_gt_path": os.path.join(HOTDOG_DIR, "hdris", "sunset.hdr"),
         },
     },
     #{
@@ -426,26 +427,21 @@ ALBEDO_VARIANTS = [
         "args": {"reg_hdr_weight": 0.1, "tv_reduction_factor": 1.0},
         "flags": {"exclude_prior_loss": True},
     },
-    #{ # besta werte
-    #    # Best GT raw-relight config (try_8/9 lineage): zncc_grad + anchor
-    #    # 0.05 + detached light-linear indirect. zncc_grad is the mode that
-    #    # must stay viable for the diffusion-prior end goal (it tolerates theart I — Complete inventory of changes vs. baseline GIR
-    #    # priors' multi-view inconsistency), so it is validated at paper scale
-    #    # even though plain zncc pins the albedo better.
-    #    "name": "gt_zncc_grad_anchor_lli2",
-    #    "args": {**_GT_BASE_ARGS, "albedo_anchor_weight": 0.05},
-    #    "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    #},
-    #{ # Gfollt mir bis iz am beschtn
-    #    # Best GT raw-relight config (try_8/9 lineage): zncc_grad + anchor
-    #    # 0.05 + detached light-linear indirect. zncc_grad is the mode that
-    #    # must stay viable for the diffusion-prior end goal (it tolerates theart I — Complete inventory of changes vs. baseline GIR
-    #    # priors' multi-view inconsistency), so it is validated at paper scale
-    #    # even though plain zncc pins the albedo better.
-    #    "name": "gt_zncc_grad_lli2_low_anchor", 
-    #    "args": {**_GT_BASE_ARGS, "albedo_anchor_weight": 0.01},
-    #    "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    #},
+    {
+        "name" : "diff_zncc_zncc",
+        "args": {
+            **_GT_BASE_ARGS,
+            "albedo_prior_mode": "zncc",
+            "albedo_gt_dir": "albedo",
+            "normal_gt_dir": "normal",
+            "metallic_gt_dir": "metallic",
+            "roughness_gt_dir": "roughness",
+            "normal_camera_convention": "opengl",
+            "lambda_metallic_gt": 0.05,
+            "lambda_normal_gt": 0.4,
+        },
+        "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
+    },
     {
         "name" : "gt_zncc_zncc_neu",
         "args": {
@@ -455,100 +451,10 @@ ALBEDO_VARIANTS = [
         },
         "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
     },
-    #{ NOT BETTER
-    #    # REPAIR-BATCH ADDITION (post-try_10, hyperparameter-only). Identical
-    #    # to gt_zncc_grad_anchor_lli2 except albedo_anchor_weight 0.05->0.15;
-    #    # NOTHING else changes (single-knob for clean attribution). Rationale:
-    #    # at 45k the headline met the relight success criterion (raw 27.62,
-    #    # gain 1.002) but its albedo drifted 1.23x too bright + blue-tinted
-    #    # (gain 0.815, raw 24.7 dB vs 31.6 aligned) — the known zncc_grad
-    #    # per-channel drift, which 0.05 is too weak to hold. try_9 (r4)
-    #    # showed 0.15 fixes exactly this (gain 0.87 -> 0.93, albedo +5 dB
-    #    # raw) at zero relight cost. The anchor is Phase-3-only, so the
-    #    # warm-up fingerprint matches the stage-2 checkpoint the envpen run
-    #    # buffered (verified HIT -> Phase 3 only, ~15 h).
-    #    # Watch: albedo gain -> ~0.93-1.0 with raw albedo 28-30 dB, relight
-    #    # raw/gain unchanged (~27.6 / ~1.0). The envmap ratio may tick up
-    #    # from 1.14 as the albedo stops absorbing scale — acceptable while
-    #    # the relight gain stays ~1.
-    #    "name": "gt_zncc_grad_anchor15_lli2",
-    #    "args": {**_GT_BASE_ARGS, "albedo_anchor_weight": 0.15},
-    #    "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    #},
-    #{ NOT BETTER
-    #    # CHALLENGER (new engine lever): zncc + anchor + LLI + envmap-mean
-    #    # penalty (--reg_env_mean_weight 0.005). Base config = try_9's best
-    #    # decomposition (gt_zncc_anchor_lli2: albedo 29.2/31.2 dB, gain 0.92,
-    #    # envmap logPSNR 30.2) whose ONLY failure was the envmap absorbing
-    #    # the transport deficit (mean ratio 1.66 -> 1.75 through phase 3,
-    #    # relight gain stuck at 1.26). The penalty puts constant downward
-    #    # pressure on the envmap mean so the photometric fit re-homes that
-    #    # energy into the light-linear LLI bounce (which transfers at
-    #    # relight) — the mechanism the try_9 diffusion run exploited through
-    #    # metallic, here offered legitimately. Weight 0.005 sits between the
-    #    # empirically mild (0.001) and drastic (0.01) values of the
-    #    # same-scale reg_hdr desaturation penalty; try_9's diffusion run
-    #    # (ratio 0.87, gains 0.85-1.04) shows mild overshoot stays benign.
-    #    # Watch: envmap_mean_ratio -> ~1.0-1.2, relight gain < 1.22, raw
-    #    # relight > 25.4 with albedo still pinned (gain ~0.92, PSNR ~29).
-    #    "name": "gt_zncc_anchor_lli2_envpen",
-    #    "args": {**_GT_BASE_ARGS, "albedo_prior_mode": "zncc",
-    #             "albedo_anchor_weight": 0.05,
-    #             "reg_env_mean_weight": 0.005},
-    #    "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    #},
-    #{
-    #    # Diffusion priors + fixed LLI, NO anchor (diffusion albedo scale is
-    #    # unreliable — anchoring to it cost 5 dB albedo PSNR in try_6). try_9:
-    #    # best raw relight (26.49) and relight SSIM (0.906) via reflectance-
-    #    # side energy compensation (metallic 0.22), worst decomposition.
-    #    "name": "diff_zncc_grad_lli2",
-    #    "args": {
-    #        **_GT_BASE_ARGS,
-    #        "albedo_gt_dir": "albedo",
-    #        "normal_gt_dir": "normal",
-    #        "metallic_gt_dir": "metallic_video",
-    #        "roughness_gt_dir": "roughness_video",
-    #        "normal_camera_convention": "opengl",
-    #        "lambda_metallic_gt": 0.05,
-    #        "lambda_normal_gt": 0.4,
-    #    },
-    #    "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    #},
-    #{
-    #    "name" : "diff_zncc_grad_lli3",
-    #    "args": {
-    #        **_GT_BASE_ARGS,
-    #        "albedo_gt_dir": "albedo",
-    #        "normal_gt_dir": "normal",
-    #        "metallic_gt_dir": "metallic_video",
-    #        "roughness_gt_dir": "roughness_video",
-    #        "normal_camera_convention": "opengl",
-    #        "lambda_metallic_gt": 0.01,
-    #        "lambda_roughness_gt": 0.01,
-    #        "lambda_normal_gt": 0.4,
-    #    },
-    #    "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    #},
-    { # bestes
-        "name" : "diff_zncc_zncc",
-        "args": {
-            **_GT_BASE_ARGS,
-            "albedo_prior_mode": "zncc",
-            "albedo_gt_dir": "albedo",
-            "normal_gt_dir": "normal",
-            "metallic_gt_dir": "metallic_video",
-            "roughness_gt_dir": "roughness_video",
-            "normal_camera_convention": "opengl",
-            "lambda_metallic_gt": 0.05,
-            "lambda_normal_gt": 0.4,
-        },
-        "flags": {**_PRIOR_FLAGS, "light_linear_indirect": True},
-    }
 ]
 
 # Where all run folders for this batch live.
-EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_10_paper_scale")
+EXPERIMENT_ROOT = os.path.join(REPO_DIR, "outputs", "new_experiments_try_10_paper_scale_hotdog")
 
 # Finished runs from earlier batches to overlay in the comparison report
 # WITHOUT re-running them (name shown in the report, absolute model path).

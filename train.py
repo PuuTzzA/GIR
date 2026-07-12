@@ -202,6 +202,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
         gain_vals = []
         albedo_psnr_vals, albedo_ssim_vals, albedo_l1_vals = [], [], []
         albedo_psnr_aligned_vals = []
+        albedo_gain_vals = []
         normal_angular_error_vals = []
         metallic_mae_vals, roughness_mae_vals = [], []
         visual_pairs = []  # (render, gt) for visual comparison
@@ -236,7 +237,14 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
                     # before comparing, so albedo modes that only recover
                     # relative structure / colour (log_chroma, gradient) are
                     # judged on decomposition quality rather than absolute scale.
-                    albedo_psnr_aligned_vals.append(scale_aligned_psnr(rendered_albedo_clamped, gt_albedo))
+                    # The gain itself is logged too: < 1 means the rendered
+                    # albedo is too BRIGHT vs GT (try_8: zncc_grad drifted to
+                    # ~0.87 despite the 0.05 anchor, zncc held ~0.98) — together
+                    # with envmap_mean_ratio this decomposes the relight gain
+                    # (relight_gain ~ envmap_mean_ratio * albedo_gain).
+                    apa_val, ag_val = scale_aligned_psnr(rendered_albedo_clamped, gt_albedo, return_gain=True)
+                    albedo_psnr_aligned_vals.append(apa_val)
+                    albedo_gain_vals.append(ag_val)
                     albedo_ssim_vals.append(ssim(rendered_albedo_clamped, gt_albedo).item())
                     albedo_l1_vals.append(l1_loss(rendered_albedo_clamped, gt_albedo).item())
 
@@ -304,6 +312,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
         if albedo_psnr_vals:
             results[f"{prefix}_albedo_psnr"] = sum(albedo_psnr_vals) / len(albedo_psnr_vals)
             results[f"{prefix}_albedo_psnr_aligned"] = sum(albedo_psnr_aligned_vals) / len(albedo_psnr_aligned_vals)
+            results[f"{prefix}_albedo_gain"] = sum(albedo_gain_vals) / len(albedo_gain_vals)
             results[f"{prefix}_albedo_ssim"] = sum(albedo_ssim_vals) / len(albedo_ssim_vals)
             results[f"{prefix}_albedo_l1"] = sum(albedo_l1_vals) / len(albedo_l1_vals)
         if normal_angular_error_vals:
@@ -482,7 +491,7 @@ def periodic_evaluation(iteration, scene, gaussians, pipe, background, first_sta
     return results
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=False, prior_weight_scheduler_ratio=0.15, prior_weight_final_ratio=1.0, albedo_prior_mode="direct", huber_delta=0.1, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace'], envmap_gt_path="", tv_reduction_factor=1.0, reduce_geo_lr_third_stage=1.0, geo_lr_final_iter=0, disable_reset_third_stage=False, albedo_geometry_warmup=False, warmup_albedo_prior_mode="", prior_geom_grad_scale=1.0, albedo_anchor_weight=0.0, lambda_normal_third_stage_scale=1.0, light_linear_indirect=False, relight_max_views=0):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, first_stage_step, second_stage_step, remove_noise, hdr_rotation, reg_hdr_weight=0.001, reg_material_weight=0.1, reg_env_mean_weight=0.0, eval_interval=2000, visual_interval=10000, lambda_albedo_gt=0.1, lambda_normal_gt=0.1, lambda_metallic_gt=0.05, lambda_roughness_gt=0.05, use_prior_weight_scheduler=False, prior_weight_scheduler_ratio=0.15, prior_weight_final_ratio=1.0, albedo_prior_mode="direct", huber_delta=0.1, exclude_prior_loss=False, eval_relight_hdris=['snowy_forest', 'moonless_night', 'fireplace'], envmap_gt_path="", tv_reduction_factor=1.0, reduce_geo_lr_third_stage=1.0, geo_lr_final_iter=0, disable_reset_third_stage=False, albedo_geometry_warmup=False, warmup_albedo_prior_mode="", prior_geom_grad_scale=1.0, albedo_anchor_weight=0.0, lambda_normal_third_stage_scale=1.0, light_linear_indirect=False, relight_max_views=0):
     # Respect user-specified intervals if they differ from the default values of 2000 / 10000.
     # Otherwise, use more reasonable dynamic defaults to avoid slowing down training.
     user_eval_set = (eval_interval != 2000)
@@ -544,8 +553,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint and os.path.exists(metrics_log_path):
         with open(metrics_log_path, "r") as f:
             metrics_log = json.load(f)
-        # Remove entries at or after the resumed iteration to avoid duplicates
-        metrics_log = [m for m in metrics_log if m["iteration"] < first_iter]
+        # Remove entries after the resumed iteration to avoid duplicates. The
+        # entry AT first_iter is kept: the checkpoint state is exactly what
+        # that eval saw, and the resumed loop (first_iter+1, ...) never
+        # re-evaluates that iteration.
+        metrics_log = [m for m in metrics_log if m["iteration"] <= first_iter]
         print(f"Loaded {len(metrics_log)} existing metric entries from {metrics_log_path}")
     else:
         metrics_log = []
@@ -556,8 +568,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with open(loss_log_path, "r") as f:
             try:
                 loss_logs = json.load(f)
-                # Remove entries at or after the resumed iteration to avoid duplicates
-                loss_logs = [l for l in loss_logs if l["iteration"] < first_iter]
+                # Keep entries up to AND INCLUDING the resumed iteration
+                # (same rule as metrics_log above).
+                loss_logs = [l for l in loss_logs if l["iteration"] <= first_iter]
                 print(f"Loaded {len(loss_logs)} existing loss component entries from {loss_log_path}")
             except Exception:
                 loss_logs = []
@@ -721,6 +734,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_metallic = tv_loss(rendered_metallic) * reg_material_weight * metallic_tv_scale
             loss_roughness = tv_loss(rendered_roughness) * reg_material_weight * roughness_tv_scale
             loss = loss + loss_albedo + loss_normal + loss_metallic + loss_roughness + loss_regularizer #+ Ll1_alpha
+            if reg_env_mean_weight > 0.0:
+                # Envmap-mean (energy) penalty. try_9 established that with all
+                # materials pinned the training envmap absorbs the renderer's
+                # missing-interreflection energy (mean ratio -> 1.75), and that
+                # this factor is LOST at relight (the swapped HDRI arrives at
+                # native intensity), while energy homed in the LLI bounce term
+                # (reflectance x env_mean) transfers. This term puts constant
+                # downward pressure on the envmap's mean radiance so the
+                # photometric fit re-homes the deficit into the (>= 0,
+                # light-linear) bounce instead. base = softplus(...) > 0, so
+                # the mean is well-defined; same per-texel gradient scale as
+                # regularizer_loss, hence the weight is comparable to
+                # reg_hdr_weight (0.001 mild, 0.01 strong).
+                loss = loss + gaussians.envlight.base.mean() * reg_env_mean_weight * multiplier
 
             # GT priors — each property is supervised independently when its GT
             # is present. A prior whose folder was set to "" is simply absent
@@ -1125,6 +1152,7 @@ if __name__ == "__main__":
     parser.add_argument("--hdr_rotation", action="store_true", default=False)
     parser.add_argument("--reg_hdr_weight", type=float, default=0.001)
     parser.add_argument("--reg_material_weight", type=float, default=0.1)
+    parser.add_argument("--reg_env_mean_weight", type=float, default=0.0, help="Weight of a penalty on the learned envmap's mean radiance (stage 3, scheduler-scaled). Pushes the transport-deficit energy out of the (non-transferable) training envmap into the light-linear LLI bounce. 0 = off (baseline).")
     parser.add_argument("--eval_interval", type=int, default=2000, help="Evaluate metrics every N iterations")
     parser.add_argument("--relight_max_views", type=int, default=0, help="Cap the relighting eval to this many evenly spaced test cameras (0 = use all test cameras); cuts the relight-eval cost by n_test/N while staying deterministic and comparable across runs")
     parser.add_argument("--visual_interval", type=int, default=10000, help="Save visual comparisons every N iterations")
@@ -1172,7 +1200,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.prior_weight_final_ratio, args.albedo_prior_mode, args.huber_delta, args.exclude_prior_loss, args.eval_relight_hdris, args.envmap_gt_path, args.tv_reduction_factor, args.reduce_geo_lr_third_stage, args.geo_lr_final_iter, args.disable_reset_third_stage, args.albedo_geometry_warmup, args.warmup_albedo_prior_mode, args.prior_geom_grad_scale, args.albedo_anchor_weight, args.lambda_normal_third_stage_scale, args.light_linear_indirect, args.relight_max_views)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.first_stage_step, args.second_stage_step, args.remove_noise, args.hdr_rotation, args.reg_hdr_weight, args.reg_material_weight, args.reg_env_mean_weight, args.eval_interval, args.visual_interval, args.lambda_albedo_gt, args.lambda_normal_gt, args.lambda_metallic_gt, args.lambda_roughness_gt, args.use_prior_weight_scheduler, args.prior_weight_scheduler_ratio, args.prior_weight_final_ratio, args.albedo_prior_mode, args.huber_delta, args.exclude_prior_loss, args.eval_relight_hdris, args.envmap_gt_path, args.tv_reduction_factor, args.reduce_geo_lr_third_stage, args.geo_lr_final_iter, args.disable_reset_third_stage, args.albedo_geometry_warmup, args.warmup_albedo_prior_mode, args.prior_geom_grad_scale, args.albedo_anchor_weight, args.lambda_normal_third_stage_scale, args.light_linear_indirect, args.relight_max_views)
 
     # All done
     print("\nTraining complete.")
